@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Iterator
 
 import pyarrow.parquet as pq
+from tqdm.auto import tqdm
 
 from .config import DatasetSpec, PipelineConfig
 from .downloader import HuggingFaceDownloader, RemoteFile
@@ -12,6 +14,7 @@ from .models import InputRecord
 
 _ROW_ID_SEPARATOR = "::row::"
 _PROCESSED_CHECKPOINT_NAMESPACE = "processed-shards"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,7 @@ class TheStackParquetSource:
         dataset: DatasetSpec,
         *,
         language: str | None = None,
+        show_progress: bool = True,
         token: str | bool | None = None,
         downloader: HuggingFaceDownloader | None = None,
     ) -> None:
@@ -44,12 +48,19 @@ class TheStackParquetSource:
         self.config = config
         self.dataset = dataset
         self.language = language
+        self.show_progress = show_progress
         self.token = token
         self.downloader = downloader or HuggingFaceDownloader()
 
     def iter_records(self, start_after: str | None = None) -> Iterator[InputRecord]:
         self.config.ensure_directories()
         resume_cursor = ShardRowCursor.parse(start_after) if start_after else None
+        _LOGGER.info(
+            "Preparing source iteration dataset=%s language=%s resume_from=%s",
+            self.dataset.name,
+            self.language or "all",
+            start_after,
+        )
         plan = self.downloader.plan_download(
             self.config,
             self.dataset,
@@ -59,6 +70,12 @@ class TheStackParquetSource:
         )
 
         for remote in plan.pending_files:
+            _LOGGER.info(
+                "Starting shard processing dataset=%s language=%s remote_path=%s",
+                self.dataset.name,
+                self.language or "all",
+                remote.path,
+            )
             local_path = self.downloader.download_remote_file(
                 self.config,
                 self.dataset,
@@ -80,6 +97,12 @@ class TheStackParquetSource:
                         checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
                     )
                     resume_cursor = None
+                    _LOGGER.info(
+                        "Finished shard processing dataset=%s language=%s remote_path=%s",
+                        self.dataset.name,
+                        self.language or "all",
+                        remote.path,
+                    )
                 if self.dataset.streaming:
                     self.downloader.remove_local_file(
                         self.config,
@@ -99,14 +122,35 @@ class TheStackParquetSource:
             start_row = resume_cursor.row_index + 1
 
         parquet_file = pq.ParquetFile(local_path)
+        _LOGGER.info(
+            "Reading parquet shard dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s",
+            self.dataset.name,
+            self.language or "all",
+            remote.path,
+            parquet_file.metadata.num_rows if parquet_file.metadata is not None else "unknown",
+            start_row,
+        )
+        progress = tqdm(
+            total=parquet_file.metadata.num_rows if parquet_file.metadata is not None else None,
+            initial=start_row,
+            desc=_progress_description(self.dataset.name, remote.path),
+            unit="rows",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+        )
         row_index = 0
-        for batch in parquet_file.iter_batches(batch_size=self.dataset.batch_size):
-            for row in batch.to_pylist():
-                if row_index < start_row:
+        try:
+            for batch in parquet_file.iter_batches(batch_size=self.dataset.batch_size):
+                for row in batch.to_pylist():
+                    if row_index < start_row:
+                        row_index += 1
+                        continue
+                    progress.update(1)
+                    yield self._row_to_input_record(remote.path, row_index, row)
                     row_index += 1
-                    continue
-                yield self._row_to_input_record(remote.path, row_index, row)
-                row_index += 1
+        finally:
+            progress.close()
 
     def _row_to_input_record(
         self,
@@ -150,3 +194,9 @@ def _first_non_null(row: dict[str, Any], *keys: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _progress_description(dataset_name: str, remote_path: str) -> str:
+    parts = remote_path.split("/")
+    shard_label = "/".join(parts[-2:]) if len(parts) >= 2 else remote_path
+    return f"{dataset_name}:{shard_label}"

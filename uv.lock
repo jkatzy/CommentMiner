@@ -62,6 +62,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "ml4setk" },
     { name = "pyarrow" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -69,6 +70,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1,<2" },
     { name = "ml4setk", url = "https://github.com/jkatzy/ML4SE-toolkit/archive/300794f8fc9016133089db2b3579e1fce5592faf.tar.gz" },
     { name = "pyarrow", specifier = ">=18,<20" },
+    { name = "tqdm", specifier = ">=4.66,<5" },
 ]
 
 [package.metadata.requires-dev]

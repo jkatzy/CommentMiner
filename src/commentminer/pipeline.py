@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from .models import CommentExtractor, CommentRecord, DatasetSource, InputRecord
 
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _slugify(value: str) -> str:
@@ -180,6 +182,7 @@ def run_dataset(
     config: PipelineConfig,
     *,
     max_records: int | None = None,
+    progress_every: int = 1000,
 ) -> PipelineRunStats:
     config.ensure_directories()
     checkpoint_store = CheckpointStore(config.storage.checkpoint_directory)
@@ -192,6 +195,13 @@ def run_dataset(
     )
     stats = PipelineRunStats(dataset=source.name, run_id=writer.run_id)
     iterator = source.iter_records(start_after=checkpoint.last_record_id)
+    _LOGGER.info(
+        "Starting mining run dataset=%s run_id=%s resume_from=%s max_records=%s",
+        source.name,
+        writer.run_id,
+        checkpoint.last_record_id,
+        max_records,
+    )
 
     try:
         for record in iterator:
@@ -209,6 +219,16 @@ def run_dataset(
 
             if stats.records_seen % config.checkpoint_interval_records == 0:
                 checkpoint_store.save(checkpoint)
+            if progress_every > 0 and stats.records_seen % progress_every == 0:
+                _LOGGER.info(
+                    "Mining progress dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s last_record_id=%s",
+                    source.name,
+                    writer.run_id,
+                    stats.records_seen,
+                    stats.comments_written,
+                    stats.skipped_without_comment,
+                    checkpoint.last_record_id,
+                )
             if max_records is not None and stats.records_seen >= max_records:
                 break
     finally:
@@ -220,4 +240,13 @@ def run_dataset(
 
     stats.shards_written = len(writer.shard_paths)
     _write_run_manifest(writer, stats, checkpoint, checkpoint_path)
+    _LOGGER.info(
+        "Finished mining run dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s shards_written=%s",
+        source.name,
+        writer.run_id,
+        stats.records_seen,
+        stats.comments_written,
+        stats.skipped_without_comment,
+        stats.shards_written,
+    )
     return stats

@@ -105,6 +105,7 @@ class TheStackParquetSourceTests(unittest.TestCase):
                 config,
                 dataset,
                 language=None,
+                show_progress=False,
                 token=str(fixture_path),
                 downloader=downloader,
             )
@@ -160,6 +161,7 @@ class TheStackParquetSourceTests(unittest.TestCase):
             source = TheStackParquetSource(
                 config,
                 dataset,
+                show_progress=False,
                 token=str(fixture_path),
                 downloader=downloader,
             )

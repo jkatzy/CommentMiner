@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from .config import DatasetSpec, PipelineConfig
 
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _slugify(value: str) -> str:
@@ -191,6 +193,13 @@ class HuggingFaceDownloader:
         allow_patterns, ignore_patterns = dataset.resolve_patterns(language)
         checkpoint_store = self.checkpoint_store(config, namespace=checkpoint_namespace)
         checkpoint = checkpoint_store.load(dataset.name, repo_id, dataset.revision, language)
+        _LOGGER.info(
+            "Planning download for dataset=%s repo=%s language=%s checkpoint_namespace=%s",
+            dataset.name,
+            repo_id,
+            language or "all",
+            checkpoint_namespace,
+        )
         remote_files = self.list_remote_files(dataset, language=language, token=token)
         completed = set(checkpoint.completed_files)
         remote_paths = {remote.path for remote in remote_files}
@@ -225,6 +234,12 @@ class HuggingFaceDownloader:
 
         repo_id = dataset.resolve_repo_id()
         allow_patterns, ignore_patterns = dataset.resolve_patterns(language)
+        _LOGGER.info(
+            "Listing remote files for dataset=%s repo=%s language=%s",
+            dataset.name,
+            repo_id,
+            language or "all",
+        )
         tree = self.api.list_repo_tree(
             repo_id=repo_id,
             repo_type=dataset.repo_type,
@@ -246,6 +261,12 @@ class HuggingFaceDownloader:
             remote_files.append(RemoteFile(path=path, size_bytes=size_bytes))
 
         remote_files.sort(key=lambda item: item.path)
+        _LOGGER.info(
+            "Resolved %s matching remote files for dataset=%s language=%s",
+            len(remote_files),
+            dataset.name,
+            language or "all",
+        )
         return remote_files
 
     def checkpoint_store(
@@ -290,6 +311,12 @@ class HuggingFaceDownloader:
         language: str | None = None,
         token: str | bool | None = None,
     ) -> Path:
+        _LOGGER.info(
+            "Downloading remote file dataset=%s language=%s path=%s",
+            dataset.name,
+            language or "all",
+            remote_path,
+        )
         local_path = self.download_file(
             repo_id=dataset.resolve_repo_id(),
             filename=remote_path,
@@ -298,6 +325,13 @@ class HuggingFaceDownloader:
             cache_dir=config.storage.huggingface_cache_directory,
             local_dir=self._download_root(config, dataset, language),
             token=token,
+        )
+        _LOGGER.info(
+            "Finished download dataset=%s language=%s path=%s local_path=%s",
+            dataset.name,
+            language or "all",
+            remote_path,
+            local_path,
         )
         return Path(local_path)
 
@@ -319,6 +353,13 @@ class HuggingFaceDownloader:
         if remote_path not in checkpoint.completed_files:
             checkpoint.completed_files.append(remote_path)
         checkpoint.last_downloaded_file = remote_path
+        _LOGGER.info(
+            "Marked file complete dataset=%s language=%s path=%s checkpoint_namespace=%s",
+            dataset.name,
+            language or "all",
+            remote_path,
+            checkpoint_namespace,
+        )
         return self.save_checkpoint(
             config,
             checkpoint,
@@ -336,6 +377,12 @@ class HuggingFaceDownloader:
         local_path = self._download_root(config, dataset, language) / remote_path
         if not local_path.exists():
             return
+        _LOGGER.info(
+            "Removing local shard dataset=%s language=%s path=%s",
+            dataset.name,
+            language or "all",
+            local_path,
+        )
         local_path.unlink()
 
         download_root = self._download_root(config, dataset, language)
@@ -365,6 +412,12 @@ class HuggingFaceDownloader:
             max_files=max_files,
             checkpoint_namespace="downloads",
         )
+        _LOGGER.info(
+            "Starting download dataset=%s language=%s pending_files=%s",
+            dataset.name,
+            language or "all",
+            len(plan.pending_files),
+        )
         checkpoint_store = self.checkpoint_store(config, namespace="downloads")
         checkpoint = checkpoint_store.load(dataset.name, plan.repo_id, plan.revision, language)
         completed = set(checkpoint.completed_files)
@@ -389,6 +442,13 @@ class HuggingFaceDownloader:
             checkpoint_store.save(checkpoint)
 
         checkpoint_path = checkpoint_store.save(checkpoint)
+        _LOGGER.info(
+            "Completed download dataset=%s language=%s downloaded_now=%s already_downloaded=%s",
+            dataset.name,
+            language or "all",
+            len(downloaded_paths),
+            plan.completed_count,
+        )
         return DownloadSummary(
             dataset=dataset.name,
             repo_id=plan.repo_id,

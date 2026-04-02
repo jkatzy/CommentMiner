@@ -87,6 +87,14 @@ row metadata to JSONL shards:
 uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
 ```
 
+For large runs, keep the default `INFO` logs or raise verbosity:
+
+```bash
+uv run commentminer --log-level INFO mine-dataset config/the-stack.sample.json the-stack --language ampl --progress-every 10000
+```
+
+`mine-dataset` now shows a per-parquet-shard `tqdm` progress bar during streaming so you can track shard-level completion and ETA. Disable that with `--no-tqdm` if you want log-only output.
+
 The saved output excludes the source `content` field. It keeps:
 
 - `opening_comment`

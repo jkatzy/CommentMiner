@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
 from typing import Sequence
 
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .extractors import ML4SEOpeningCommentExtractor
+from .logging_utils import configure_logging
 from .pipeline import run_dataset
 from .sources import TheStackParquetSource
 
@@ -17,6 +21,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="commentminer",
         description="Utilities for inspecting CommentMiner pipeline configuration.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Logging verbosity for long-running operations.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -70,6 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--token-env")
     mine.add_argument("--max-records", type=int)
     mine.add_argument("--max-comment-start-row", type=int, default=3)
+    mine.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="Emit a mining progress log every N records.",
+    )
+    mine.add_argument(
+        "--no-tqdm",
+        action="store_true",
+        help="Disable per-shard tqdm progress bars during parquet streaming.",
+    )
 
     return parser
 
@@ -213,6 +234,7 @@ def _build_source(
     dataset_name: str,
     *,
     language: str | None,
+    show_progress: bool,
     token_env: str | None,
 ):
     dataset = config.require_dataset(dataset_name)
@@ -222,6 +244,7 @@ def _build_source(
             config,
             dataset,
             language=language,
+            show_progress=show_progress,
             token=token,
         )
     raise ValueError(
@@ -234,24 +257,30 @@ def _mine_dataset(
     dataset_name: str,
     *,
     language: str | None,
+    show_progress: bool,
     token_env: str | None,
     max_records: int | None,
     max_comment_start_row: int,
+    progress_every: int,
 ) -> int:
     config = PipelineConfig.from_path(config_path)
     dataset, source = _build_source(
         config,
         dataset_name,
         language=language,
+        show_progress=show_progress,
         token_env=token_env,
     )
     extractor = ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row)
-    stats = run_dataset(
-        source,
-        extractor,
-        config,
-        max_records=max_records,
-    )
+    logging_context = logging_redirect_tqdm() if show_progress else nullcontext()
+    with logging_context:
+        stats = run_dataset(
+            source,
+            extractor,
+            config,
+            max_records=max_records,
+            progress_every=progress_every,
+        )
     print(f"Dataset: {dataset.name}")
     print(f"Language: {language or 'all'}")
     print(f"Records seen: {stats.records_seen}")
@@ -264,6 +293,7 @@ def _mine_dataset(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(args.log_level)
 
     try:
         if args.command == "validate-config":
@@ -294,9 +324,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.config,
                 args.dataset,
                 language=args.language,
+                show_progress=not args.no_tqdm,
                 token_env=args.token_env,
                 max_records=args.max_records,
                 max_comment_start_row=args.max_comment_start_row,
+                progress_every=args.progress_every,
             )
     except (KeyError, ValueError) as exc:
         parser.exit(status=2, message=f"{exc}\n")

@@ -97,6 +97,7 @@ class MiningTests(unittest.TestCase):
             source = TheStackParquetSource(
                 config,
                 dataset,
+                show_progress=False,
                 token=str(fixture_path),
                 downloader=HuggingFaceDownloader(
                     api=FakeApi([FakeRepoFile("data/python/train-00000-of-00001.parquet", 10)]),
