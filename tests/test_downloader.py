@@ -34,6 +34,29 @@ def fake_download_file(**kwargs: object) -> str:
 
 
 class HuggingFaceDownloaderTests(unittest.TestCase):
+    def test_list_languages_discovers_languages_from_remote_paths(self) -> None:
+        dataset = DatasetSpec(
+            name="the-stack",
+            source="huggingface_hub",
+            repo_id="bigcode/the-stack",
+            repo_type="dataset",
+            revision="main",
+            allow_patterns=["data/{language}/**"],
+        )
+        downloader = HuggingFaceDownloader(
+            api=FakeApi(
+                [
+                    FakeRepoFile("data/python/train-00000-of-00001.parquet", 10),
+                    FakeRepoFile("data/java/train-00000-of-00001.parquet", 12),
+                    FakeRepoFile("data/python/train-00001-of-00001.parquet", 14),
+                ]
+            )
+        )
+
+        languages = downloader.list_languages(dataset)
+
+        self.assertEqual(languages, ["java", "python"])
+
     def test_plan_download_uses_language_filter_and_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

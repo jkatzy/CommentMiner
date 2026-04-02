@@ -16,6 +16,7 @@ from .config import DatasetSpec, PipelineConfig
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
 _LOGGER = logging.getLogger(__name__)
+_LANGUAGE_PLACEHOLDER = "__COMMENTMINER_LANGUAGE__"
 
 
 def _slugify(value: str) -> str:
@@ -35,6 +36,13 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
 
 def _matches_none(path: str, patterns: list[str]) -> bool:
     return not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def _compile_language_pattern(pattern: str) -> re.Pattern[str]:
+    translated = fnmatch.translate(pattern.replace("{language}", _LANGUAGE_PLACEHOLDER))
+    return re.compile(
+        translated.replace(_LANGUAGE_PLACEHOLDER, r"(?P<language>[^/]+)")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +276,45 @@ class HuggingFaceDownloader:
             language or "all",
         )
         return remote_files
+
+    def list_languages(
+        self,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None = None,
+    ) -> list[str]:
+        configured_languages = dataset.available_languages()
+        if configured_languages:
+            return configured_languages
+        if dataset.source != "huggingface_hub" or not dataset.supports_language_selection():
+            return []
+
+        discovery_patterns = dataset.language_discovery_patterns()
+        if not discovery_patterns:
+            return []
+
+        _LOGGER.info(
+            "Discovering languages for dataset=%s repo=%s",
+            dataset.name,
+            dataset.resolve_repo_id(),
+        )
+        remote_files = self.list_remote_files(dataset, token=token)
+        compiled_patterns = [_compile_language_pattern(pattern) for pattern in discovery_patterns]
+        languages: set[str] = set()
+        for remote in remote_files:
+            for pattern in compiled_patterns:
+                match = pattern.match(remote.path)
+                if match is None:
+                    continue
+                languages.add(match.group("language"))
+                break
+        discovered = sorted(languages)
+        _LOGGER.info(
+            "Discovered %s languages for dataset=%s",
+            len(discovered),
+            dataset.name,
+        )
+        return discovered
 
     def checkpoint_store(
         self,

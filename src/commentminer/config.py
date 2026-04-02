@@ -131,6 +131,14 @@ class DatasetSpec:
         configured.update(self.language_patterns.keys())
         return sorted(configured)
 
+    def language_discovery_patterns(self) -> list[str]:
+        patterns: list[str] = []
+        for pattern in self.allow_patterns:
+            if "{language}" not in pattern:
+                continue
+            patterns.append(self._format_pattern(pattern, language="{language}"))
+        return patterns
+
     def resolve_repo_id(self) -> str:
         if self.repo_id:
             return self.repo_id
