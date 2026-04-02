@@ -1,0 +1,45 @@
+{
+  "storage": {
+    "working_directory": "../var/work",
+    "output_directory": "../var/output",
+    "checkpoint_directory": "../var/checkpoints",
+    "download_directory": "../var/downloads",
+    "huggingface_cache_directory": "../var/hf-cache",
+    "max_records_per_shard": 100000,
+    "max_bytes_per_shard": 134217728
+  },
+  "datasets": [
+    {
+      "name": "the-stack",
+      "source": "huggingface_hub",
+      "repo_id": "bigcode/the-stack",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "languages": [
+        "ampl",
+        "befunge",
+        "dogescript"
+      ],
+      "allow_patterns": [
+        "data/{language}/**"
+      ],
+      "ignore_patterns": [
+        "**/.gitattributes",
+        "**/README.md"
+      ],
+      "extra": {
+        "notes": "General The Stack sample config. Add more language directory names as needed.",
+        "small_language_examples": {
+          "ampl": "70980 bytes",
+          "befunge": "24791 bytes",
+          "dogescript": "134566 bytes"
+        }
+      }
+    }
+  ],
+  "checkpoint_interval_records": 1000
+}

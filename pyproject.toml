@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commentminer"
+version = "0.1.0"
+description = "Storage-aware pipeline scaffolding for mining opening comments from large code datasets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=1,<2",
+    "ml4setk",
+    "pyarrow>=18,<20",
+]
+
+[dependency-groups]
+dev = []
+
+[project.scripts]
+commentminer = "commentminer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+ml4setk = { url = "https://github.com/jkatzy/ML4SE-toolkit/archive/300794f8fc9016133089db2b3579e1fce5592faf.tar.gz" }

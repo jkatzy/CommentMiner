@@ -1,0 +1,55 @@
+{
+  "storage": {
+    "working_directory": "../var/work",
+    "output_directory": "../var/output",
+    "checkpoint_directory": "../var/checkpoints",
+    "download_directory": "../var/downloads",
+    "huggingface_cache_directory": "../var/hf-cache",
+    "max_records_per_shard": 100000,
+    "max_bytes_per_shard": 134217728
+  },
+  "datasets": [
+    {
+      "name": "the-stack-v2",
+      "source": "huggingface_hub",
+      "repo_id": "replace-with-hf-dataset-repo-id",
+      "repo_type": "dataset",
+      "revision": "main",
+      "input_uri": "replace-with-hf-dataset-repo-id",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "languages": [
+        "python",
+        "java"
+      ],
+      "allow_patterns": [
+        "replace-with-dataset-specific-root/{language}/**"
+      ],
+      "ignore_patterns": [
+        "**/.gitattributes",
+        "**/README.md"
+      ],
+      "extra": {
+        "notes": "Replace repo_id and patterns with the real Hugging Face dataset layout."
+      }
+    },
+    {
+      "name": "the-stack",
+      "source": "huggingface_hub",
+      "repo_id": "replace-with-hf-dataset-repo-id",
+      "repo_type": "dataset",
+      "revision": "main",
+      "input_uri": "replace-with-hf-dataset-repo-id",
+      "split": "train",
+      "streaming": true,
+      "enabled": false,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "replace-with-dataset-specific-root/**"
+      ]
+    }
+  ],
+  "checkpoint_interval_records": 1000
+}
