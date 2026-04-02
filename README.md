@@ -107,6 +107,8 @@ Inspect configured language choices:
 uv run commentminer list-languages config/pipeline.example.json the-stack-v2
 ```
 
+When a dataset config does not pin a fixed `languages` list, `list-languages` now discovers language names from the Hugging Face repo layout.
+
 Preview the files that would be downloaded:
 
 ```bash

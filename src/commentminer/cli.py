@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_languages.add_argument("config", type=Path)
     list_languages.add_argument("dataset")
+    list_languages.add_argument("--token-env")
 
     plan_download = subparsers.add_parser(
         "plan-download",
@@ -138,13 +139,21 @@ def _format_size(size_bytes: int | None) -> str:
     return f"{size_bytes} B"
 
 
-def _list_languages(config_path: Path, dataset_name: str) -> int:
+def _list_languages(
+    config_path: Path,
+    dataset_name: str,
+    *,
+    token_env: str | None,
+) -> int:
     config = PipelineConfig.from_path(config_path)
     dataset = config.require_dataset(dataset_name)
     if not dataset.supports_language_selection():
         print(f"Dataset '{dataset.name}' does not define language-aware download selection.")
         return 0
     languages = dataset.available_languages()
+    if not languages and dataset.source == "huggingface_hub":
+        downloader = HuggingFaceDownloader()
+        languages = downloader.list_languages(dataset, token=_resolve_token(token_env))
     if not languages:
         print(f"Dataset '{dataset.name}' supports language templating, but no fixed language list is configured.")
         return 0
@@ -301,7 +310,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "dump-config":
             return _dump_config(args.config)
         if args.command == "list-languages":
-            return _list_languages(args.config, args.dataset)
+            return _list_languages(
+                args.config,
+                args.dataset,
+                token_env=args.token_env,
+            )
         if args.command == "plan-download":
             return _plan_download(
                 args.config,

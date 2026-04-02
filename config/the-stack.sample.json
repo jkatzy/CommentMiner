@@ -19,11 +19,6 @@
       "streaming": true,
       "enabled": true,
       "batch_size": 1000,
-      "languages": [
-        "ampl",
-        "befunge",
-        "dogescript"
-      ],
       "allow_patterns": [
         "data/{language}/**"
       ],
@@ -32,7 +27,7 @@
         "**/README.md"
       ],
       "extra": {
-        "notes": "General The Stack sample config. Add more language directory names as needed.",
+        "notes": "General The Stack sample config. Languages are discovered from the Hugging Face repo layout at runtime.",
         "small_language_examples": {
           "ampl": "70980 bytes",
           "befunge": "24791 bytes",
