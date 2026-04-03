@@ -55,6 +55,7 @@ def _normalize_language_token(value: str) -> list[str]:
 @dataclass(slots=True)
 class ML4SEOpeningCommentExtractor:
     max_start_row: int = 3
+    max_input_characters: int | None = None
     _supported_languages: set[str] = field(
         default_factory=lambda: set(get_supported_comment_languages())
     )
@@ -70,7 +71,7 @@ class ML4SEOpeningCommentExtractor:
             return None
 
         query = self._query_for_language(language)
-        matches = query.parse(record.content)
+        matches = query.parse(_truncate_text(record.content, self.max_input_characters))
         if not matches:
             return None
         return matches[0].match
@@ -121,3 +122,13 @@ class ML4SEOpeningCommentExtractor:
                 result.append(value)
                 seen.add(value)
         return result
+
+
+def _truncate_text(text: str, max_characters: int | None) -> str:
+    if max_characters is None:
+        return text
+    if max_characters < 1:
+        raise ValueError(f"max_input_characters must be >= 1, got {max_characters}")
+    if len(text) <= max_characters:
+        return text
+    return text[:max_characters]

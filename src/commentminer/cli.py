@@ -87,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--max-records", type=int)
     mine.add_argument("--max-comment-start-row", type=int, default=3)
     mine.add_argument(
+        "--max-parser-characters",
+        type=int,
+        default=None,
+        help="Limit the parser input to the first N characters of each file.",
+    )
+    mine.add_argument(
         "--progress-every",
         type=int,
         default=1000,
@@ -281,6 +287,7 @@ def _mine_dataset(
     token_env: str | None,
     max_records: int | None,
     max_comment_start_row: int,
+    max_parser_characters: int | None,
     progress_every: int,
     workers: int,
 ) -> int:
@@ -297,7 +304,10 @@ def _mine_dataset(
         with logging_context:
             stats = run_sharded_dataset(
                 source,
-                lambda: ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row),
+                lambda: ML4SEOpeningCommentExtractor(
+                    max_start_row=max_comment_start_row,
+                    max_input_characters=max_parser_characters,
+                ),
                 config,
                 max_workers=workers,
                 progress_every=progress_every,
@@ -310,7 +320,10 @@ def _mine_dataset(
                 " to preserve an exact sample size."
             )
             print(warning, file=sys.stderr)
-        extractor = ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row)
+        extractor = ML4SEOpeningCommentExtractor(
+            max_start_row=max_comment_start_row,
+            max_input_characters=max_parser_characters,
+        )
         with logging_context:
             stats = run_dataset(
                 source,
@@ -371,6 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token_env=args.token_env,
                 max_records=args.max_records,
                 max_comment_start_row=args.max_comment_start_row,
+                max_parser_characters=args.max_parser_characters,
                 progress_every=args.progress_every,
                 workers=args.workers,
             )

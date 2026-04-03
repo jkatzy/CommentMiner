@@ -11,6 +11,7 @@ STATE_ROOT="${COMMENTMINER_STATE_ROOT:-$REPO_ROOT/var/server-state/the-stack}"
 LOG_LEVEL="${COMMENTMINER_LOG_LEVEL:-INFO}"
 PROGRESS_EVERY="${COMMENTMINER_PROGRESS_EVERY:-1000}"
 MAX_COMMENT_START_ROW="${COMMENTMINER_MAX_COMMENT_START_ROW:-3}"
+MAX_PARSER_CHARACTERS="${COMMENTMINER_MAX_PARSER_CHARACTERS:-5000}"
 PARQUET_BATCH_SIZE="${COMMENTMINER_BATCH_SIZE:-32}"
 TOKEN_ENV="${COMMENTMINER_TOKEN_ENV:-}"
 NO_TQDM="${COMMENTMINER_NO_TQDM:-0}"
@@ -55,6 +56,11 @@ fi
 
 if ! [[ "$PARQUET_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid COMMENTMINER_BATCH_SIZE value: '$PARQUET_BATCH_SIZE'" >&2
+  exit 1
+fi
+
+if ! [[ "$MAX_PARSER_CHARACTERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid COMMENTMINER_MAX_PARSER_CHARACTERS value: '$MAX_PARSER_CHARACTERS'" >&2
   exit 1
 fi
 
@@ -135,6 +141,7 @@ run_language() {
     --workers "$WORKERS"
     --progress-every "$PROGRESS_EVERY"
     --max-comment-start-row "$MAX_COMMENT_START_ROW"
+    --max-parser-characters "$MAX_PARSER_CHARACTERS"
   )
   if [[ -n "$TOKEN_ENV" ]]; then
     cmd+=(--token-env "$TOKEN_ENV")
@@ -148,6 +155,7 @@ run_language() {
   echo "State root:  $STATE_ROOT/$language"
   echo "Workers:     $WORKERS ($WORKER_SOURCE)"
   echo "Batch size:  $PARQUET_BATCH_SIZE"
+  echo "Parser chars:$MAX_PARSER_CHARACTERS"
 
   if "${cmd[@]}"; then
     echo "=== Completed language: $language ==="

@@ -57,6 +57,7 @@ class CliTests(unittest.TestCase):
                     token_env=None,
                     max_records=3,
                     max_comment_start_row=3,
+                    max_parser_characters=5000,
                     progress_every=1000,
                     workers=4,
                 )

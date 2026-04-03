@@ -34,6 +34,20 @@ class ExtractorTests(unittest.TestCase):
 
         self.assertIsNone(extractor.extract_opening_comment(record))
 
+    def test_ml4se_extractor_limits_parser_input_by_character_count(self) -> None:
+        extractor = ML4SEOpeningCommentExtractor(max_input_characters=12)
+        record = InputRecord(
+            dataset="the-stack",
+            record_id="r3",
+            content="# short\nprint('x')\n",
+            language="Python",
+            metadata={"selected_language": "python"},
+        )
+
+        match = extractor.extract_opening_comment(record)
+
+        self.assertEqual(match, "# short")
+
 
 if __name__ == "__main__":
     unittest.main()
