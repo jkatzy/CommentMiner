@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 import hashlib
 import json
 import logging
+from multiprocessing import get_context
 import re
 import threading
 from dataclasses import asdict, dataclass
@@ -13,7 +14,9 @@ from typing import Callable
 
 from tqdm.auto import tqdm
 
-from .config import PipelineConfig
+from .config import DatasetSpec, PipelineConfig
+from .downloader import RemoteFile
+from .extractors import ML4SEOpeningCommentExtractor
 from .models import CommentExtractor, CommentRecord, DatasetSource, InputRecord
 from .sources import TheStackParquetSource
 
@@ -358,6 +361,39 @@ def _process_stack_shard(
             temp_output_path.unlink()
 
 
+def _process_stack_shard_subprocess(
+    config_data: dict[str, object],
+    dataset_data: dict[str, object],
+    language: str | None,
+    token: str | bool | None,
+    remote_path: str,
+    remote_size_bytes: int | None,
+    temp_root_str: str,
+    max_start_row: int,
+    max_input_characters: int | None,
+) -> CompletedShardResult:
+    config = PipelineConfig.from_dict(config_data, base_dir=Path.cwd())
+    dataset = DatasetSpec.from_dict(dataset_data)
+    source = TheStackParquetSource(
+        config,
+        dataset,
+        language=language,
+        show_progress=False,
+        token=token,
+    )
+    extractor = ML4SEOpeningCommentExtractor(
+        max_start_row=max_start_row,
+        max_input_characters=max_input_characters,
+    )
+    return _process_stack_shard(
+        source,
+        RemoteFile(path=remote_path, size_bytes=remote_size_bytes),
+        lambda: extractor,
+        Path(temp_root_str),
+        show_progress=False,
+    )
+
+
 def run_sharded_dataset(
     source: TheStackParquetSource,
     extractor_factory: Callable[[], CommentExtractor],
@@ -388,6 +424,14 @@ def run_sharded_dataset(
     extractor_local = threading.local()
     progress_lock = threading.Lock()
     only_one_shard = False
+    sample_extractor = extractor_factory()
+    use_process_workers = (
+        max_workers > 1
+        and isinstance(sample_extractor, ML4SEOpeningCommentExtractor)
+        and source.downloader.supports_subprocess_workers()
+    )
+    config_data = config.to_dict()
+    dataset_data = source.dataset.to_dict()
     shard_progress = tqdm(
         total=None,
         desc=f"{source.name}:shards",
@@ -402,7 +446,7 @@ def run_sharded_dataset(
         unit="row",
         dynamic_ncols=True,
         leave=False,
-        disable=not source.show_progress or max_workers == 1,
+        disable=not source.show_progress or max_workers == 1 or use_process_workers,
     )
     _LOGGER.info(
         "Starting sharded mining run dataset=%s run_id=%s pending_shards=%s workers=%s",
@@ -410,6 +454,12 @@ def run_sharded_dataset(
         writer.run_id,
         "streaming",
         max_workers,
+    )
+    _LOGGER.info(
+        "Using %s shard workers for dataset=%s language=%s",
+        "process" if use_process_workers else "thread",
+        source.name,
+        source.language or "all",
     )
 
     def _update_success(remote, result: CompletedShardResult) -> None:
@@ -470,20 +520,42 @@ def run_sharded_dataset(
             )
             return False
         discovered_shards += 1
-        future = executor.submit(
-            _process_stack_shard,
-            source,
-            remote,
-            _extractor_for_thread,
-            temp_root,
-            show_progress=source.show_progress and max_workers == 1,
-            on_records_processed=_on_records_processed if source.show_progress and max_workers > 1 else None,
-        )
+        if use_process_workers:
+            future = executor.submit(
+                _process_stack_shard_subprocess,
+                config_data,
+                dataset_data,
+                source.language,
+                source.token,
+                remote.path,
+                remote.size_bytes,
+                str(temp_root),
+                sample_extractor.max_start_row,
+                sample_extractor.max_input_characters,
+            )
+        else:
+            future = executor.submit(
+                _process_stack_shard,
+                source,
+                remote,
+                _extractor_for_thread,
+                temp_root,
+                show_progress=source.show_progress and max_workers == 1,
+                on_records_processed=_on_records_processed if source.show_progress and max_workers > 1 else None,
+            )
         futures[future] = remote
         return True
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor_kwargs = {"max_workers": max_workers}
+        if use_process_workers:
+            executor = ProcessPoolExecutor(
+                mp_context=get_context("spawn"),
+                **executor_kwargs,
+            )
+        else:
+            executor = ThreadPoolExecutor(**executor_kwargs)
+        with executor:
             for _ in range(max_workers):
                 if not _submit_next(executor):
                     break

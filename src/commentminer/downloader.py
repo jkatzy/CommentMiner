@@ -187,6 +187,9 @@ class HuggingFaceDownloader:
         self.api = api or HfApi()
         self.download_file = download_file or hf_hub_download
 
+    def supports_subprocess_workers(self) -> bool:
+        return isinstance(self.api, HfApi) and self.download_file is hf_hub_download
+
     def plan_download(
         self,
         config: PipelineConfig,
