@@ -307,27 +307,34 @@ def _process_stack_shard(
     temp_root: Path,
     *,
     show_progress: bool,
+    on_records_processed: Callable[[int], None] | None = None,
+    progress_update_every: int = 32,
 ) -> CompletedShardResult:
     extractor = extractor_factory()
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_output_path = _temp_output_path(temp_root, remote.path)
     handle = None
     records_seen = 0
+    unreported_records = 0
     comments_written = 0
     skipped_without_comment = 0
     last_record_id: str | None = None
     try:
         for record in source.iter_shard_records(remote, show_progress=show_progress):
             records_seen += 1
+            unreported_records += 1
             last_record_id = record.record_id
             comment = _normalize_comment(extractor.extract_opening_comment(record))
             if comment is None:
                 skipped_without_comment += 1
-                continue
-            if handle is None:
-                handle = temp_output_path.open("w", encoding="utf-8")
-            _write_json_line(handle, _build_comment_record(record, comment))
-            comments_written += 1
+            else:
+                if handle is None:
+                    handle = temp_output_path.open("w", encoding="utf-8")
+                _write_json_line(handle, _build_comment_record(record, comment))
+                comments_written += 1
+            if on_records_processed is not None and unreported_records >= progress_update_every:
+                on_records_processed(unreported_records)
+                unreported_records = 0
         return CompletedShardResult(
             remote_path=remote.path,
             temp_output_path=temp_output_path if comments_written > 0 else None,
@@ -343,6 +350,8 @@ def _process_stack_shard(
             temp_output_path.unlink()
         raise
     finally:
+        if on_records_processed is not None and unreported_records > 0:
+            on_records_processed(unreported_records)
         if handle is not None and not handle.closed:
             handle.close()
         if comments_written == 0 and temp_output_path.exists():
@@ -377,6 +386,8 @@ def run_sharded_dataset(
     discovered_shards = 0
     discovery_error: BaseException | None = None
     extractor_local = threading.local()
+    progress_lock = threading.Lock()
+    only_one_shard = False
     shard_progress = tqdm(
         total=None,
         desc=f"{source.name}:shards",
@@ -384,6 +395,14 @@ def run_sharded_dataset(
         dynamic_ncols=True,
         leave=False,
         disable=not source.show_progress or max_workers <= 1,
+    )
+    row_progress = tqdm(
+        total=None,
+        desc=f"{source.name}:rows",
+        unit="row",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not source.show_progress or max_workers == 1,
     )
     _LOGGER.info(
         "Starting sharded mining run dataset=%s run_id=%s pending_shards=%s workers=%s",
@@ -424,16 +443,22 @@ def run_sharded_dataset(
             extractor_local.extractor = extractor
         return extractor
 
+    def _on_records_processed(count: int) -> None:
+        with progress_lock:
+            row_progress.update(count)
+
     futures: dict[Future[CompletedShardResult], object] = {}
     shard_iter = iter(pending_shards)
+    exhausted_pending_shards = False
 
     def _submit_next(executor: ThreadPoolExecutor) -> bool:
-        nonlocal discovered_shards, discovery_error
+        nonlocal discovered_shards, discovery_error, exhausted_pending_shards
         if discovery_error is not None:
             return False
         try:
             remote = next(shard_iter)
         except StopIteration:
+            exhausted_pending_shards = True
             return False
         except BaseException as exc:
             discovery_error = exc
@@ -452,6 +477,7 @@ def run_sharded_dataset(
             _extractor_for_thread,
             temp_root,
             show_progress=source.show_progress and max_workers == 1,
+            on_records_processed=_on_records_processed if source.show_progress and max_workers > 1 else None,
         )
         futures[future] = remote
         return True
@@ -461,6 +487,13 @@ def run_sharded_dataset(
             for _ in range(max_workers):
                 if not _submit_next(executor):
                     break
+            if max_workers > 1 and exhausted_pending_shards and len(futures) == 1:
+                only_one_shard = True
+                _LOGGER.warning(
+                    "Only one pending shard is available for dataset=%s language=%s; additional workers cannot speed up this run because multithreading is shard-parallel.",
+                    source.name,
+                    source.language or "all",
+                )
             while futures:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -484,6 +517,7 @@ def run_sharded_dataset(
                     _submit_next(executor)
     finally:
         shard_progress.close()
+        row_progress.close()
         checkpoint_path = checkpoint_store.save(checkpoint)
         writer.close()
         if temp_root.exists():
