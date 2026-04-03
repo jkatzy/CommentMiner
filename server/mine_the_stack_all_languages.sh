@@ -13,12 +13,44 @@ PROGRESS_EVERY="${COMMENTMINER_PROGRESS_EVERY:-1000}"
 MAX_COMMENT_START_ROW="${COMMENTMINER_MAX_COMMENT_START_ROW:-3}"
 TOKEN_ENV="${COMMENTMINER_TOKEN_ENV:-}"
 NO_TQDM="${COMMENTMINER_NO_TQDM:-0}"
+MAX_AUTO_WORKERS="${COMMENTMINER_MAX_AUTO_WORKERS:-8}"
+WORKERS_OVERRIDE="${COMMENTMINER_WORKERS:-${WORKERS:-}}"
+AUTO_WORKERS=4
+WORKER_SOURCE="auto"
+
 if command -v nproc >/dev/null 2>&1; then
-  DEFAULT_WORKERS="$(nproc)"
-else
-  DEFAULT_WORKERS=4
+  AUTO_WORKERS="$(nproc)"
 fi
-WORKERS="${COMMENTMINER_WORKERS:-$DEFAULT_WORKERS}"
+
+if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
+  AUTO_WORKERS="${SLURM_CPUS_PER_TASK}"
+fi
+
+if ! [[ "$AUTO_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid auto-detected worker count: '$AUTO_WORKERS'" >&2
+  exit 1
+fi
+
+if ! [[ "$MAX_AUTO_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid COMMENTMINER_MAX_AUTO_WORKERS value: '$MAX_AUTO_WORKERS'" >&2
+  exit 1
+fi
+
+if (( AUTO_WORKERS > MAX_AUTO_WORKERS )); then
+  AUTO_WORKERS="$MAX_AUTO_WORKERS"
+fi
+
+if [[ -n "$WORKERS_OVERRIDE" ]]; then
+  WORKERS="$WORKERS_OVERRIDE"
+  WORKER_SOURCE="override"
+else
+  WORKERS="$AUTO_WORKERS"
+fi
+
+if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid worker count: '$WORKERS'" >&2
+  exit 1
+fi
 
 declare -a TEMP_CONFIGS=()
 declare -a FAILED_LANGUAGES=()
@@ -105,7 +137,7 @@ run_language() {
   echo "=== Starting language: $language ==="
   echo "Output root: $OUTPUT_ROOT/$language/the-stack"
   echo "State root:  $STATE_ROOT/$language"
-  echo "Workers:     $WORKERS"
+  echo "Workers:     $WORKERS ($WORKER_SOURCE)"
 
   if "${cmd[@]}"; then
     echo "=== Completed language: $language ==="
