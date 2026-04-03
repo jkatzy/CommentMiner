@@ -11,6 +11,7 @@ STATE_ROOT="${COMMENTMINER_STATE_ROOT:-$REPO_ROOT/var/server-state/the-stack}"
 LOG_LEVEL="${COMMENTMINER_LOG_LEVEL:-INFO}"
 PROGRESS_EVERY="${COMMENTMINER_PROGRESS_EVERY:-1000}"
 MAX_COMMENT_START_ROW="${COMMENTMINER_MAX_COMMENT_START_ROW:-3}"
+PARQUET_BATCH_SIZE="${COMMENTMINER_BATCH_SIZE:-32}"
 TOKEN_ENV="${COMMENTMINER_TOKEN_ENV:-}"
 NO_TQDM="${COMMENTMINER_NO_TQDM:-0}"
 MAX_AUTO_WORKERS="${COMMENTMINER_MAX_AUTO_WORKERS:-8}"
@@ -52,6 +53,11 @@ if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+if ! [[ "$PARQUET_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid COMMENTMINER_BATCH_SIZE value: '$PARQUET_BATCH_SIZE'" >&2
+  exit 1
+fi
+
 declare -a TEMP_CONFIGS=()
 declare -a FAILED_LANGUAGES=()
 declare -a LANGUAGES=()
@@ -85,7 +91,7 @@ write_language_config() {
   local language_output_root="$OUTPUT_ROOT/$language"
   local language_state_root="$STATE_ROOT/$language"
 
-  uv run python - "$CONFIG_PATH" "$temp_config" "$language_output_root" "$language_state_root" <<'PY'
+  uv run python - "$CONFIG_PATH" "$temp_config" "$language_output_root" "$language_state_root" "$PARQUET_BATCH_SIZE" <<'PY'
 from __future__ import annotations
 
 import json
@@ -96,6 +102,7 @@ source_config = Path(sys.argv[1])
 temp_config = Path(sys.argv[2])
 language_output_root = Path(sys.argv[3]).resolve()
 language_state_root = Path(sys.argv[4]).resolve()
+parquet_batch_size = int(sys.argv[5])
 
 config = json.loads(source_config.read_text(encoding="utf-8"))
 storage = config["storage"]
@@ -104,6 +111,8 @@ storage["output_directory"] = str(language_output_root)
 storage["checkpoint_directory"] = str((language_state_root / "checkpoints").resolve())
 storage["download_directory"] = str((language_state_root / "downloads").resolve())
 storage["huggingface_cache_directory"] = str((language_state_root / "hf-cache").resolve())
+for dataset in config.get("datasets", []):
+    dataset["batch_size"] = parquet_batch_size
 
 temp_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
 PY
@@ -138,6 +147,7 @@ run_language() {
   echo "Output root: $OUTPUT_ROOT/$language/the-stack"
   echo "State root:  $STATE_ROOT/$language"
   echo "Workers:     $WORKERS ($WORKER_SOURCE)"
+  echo "Batch size:  $PARQUET_BATCH_SIZE"
 
   if "${cmd[@]}"; then
     echo "=== Completed language: $language ==="

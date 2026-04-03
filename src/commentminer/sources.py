@@ -200,7 +200,7 @@ class TheStackParquetSource:
         row_index = 0
         try:
             for batch in parquet_file.iter_batches(batch_size=self.dataset.batch_size):
-                for row in batch.to_pylist():
+                for row in _iter_batch_rows(batch):
                     if row_index < start_row:
                         row_index += 1
                         continue
@@ -252,6 +252,16 @@ def _first_non_null(row: dict[str, Any], *keys: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _iter_batch_rows(batch) -> Iterator[dict[str, Any]]:
+    column_names = batch.schema.names
+    columns = [batch.column(index) for index in range(batch.num_columns)]
+    for row_index in range(batch.num_rows):
+        row: dict[str, Any] = {}
+        for name, column in zip(column_names, columns, strict=True):
+            row[name] = column[row_index].as_py()
+        yield row
 
 
 def _progress_description(dataset_name: str, remote_path: str) -> str:

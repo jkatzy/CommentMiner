@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -375,6 +376,7 @@ def run_sharded_dataset(
     progress_target = progress_every if progress_every > 0 else None
     discovered_shards = 0
     discovery_error: BaseException | None = None
+    extractor_local = threading.local()
     shard_progress = tqdm(
         total=None,
         desc=f"{source.name}:shards",
@@ -415,6 +417,13 @@ def run_sharded_dataset(
             while stats.records_seen >= progress_target:
                 progress_target += progress_every
 
+    def _extractor_for_thread() -> CommentExtractor:
+        extractor = getattr(extractor_local, "extractor", None)
+        if extractor is None:
+            extractor = extractor_factory()
+            extractor_local.extractor = extractor
+        return extractor
+
     futures: dict[Future[CompletedShardResult], object] = {}
     shard_iter = iter(pending_shards)
 
@@ -440,7 +449,7 @@ def run_sharded_dataset(
             _process_stack_shard,
             source,
             remote,
-            extractor_factory,
+            _extractor_for_thread,
             temp_root,
             show_progress=source.show_progress and max_workers == 1,
         )
