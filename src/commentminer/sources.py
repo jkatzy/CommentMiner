@@ -55,16 +55,18 @@ class TheStackParquetSource:
         self.failed_shards: list[str] = []
 
     def pending_shards(self) -> list[RemoteFile]:
+        return list(self.iter_pending_shards())
+
+    def iter_pending_shards(self) -> Iterator[RemoteFile]:
         self.config.ensure_directories()
         self.failed_shards = []
-        plan = self.downloader.plan_download(
+        yield from self.downloader.iter_pending_files(
             self.config,
             self.dataset,
             language=self.language,
             token=self.token,
             checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
         )
-        return list(plan.pending_files)
 
     def iter_shard_records(
         self,
@@ -123,15 +125,7 @@ class TheStackParquetSource:
             self.language or "all",
             start_after,
         )
-        plan = self.downloader.plan_download(
-            self.config,
-            self.dataset,
-            language=self.language,
-            token=self.token,
-            checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
-        )
-
-        for remote in plan.pending_files:
+        for remote in self.iter_pending_shards():
             _LOGGER.info(
                 "Starting shard processing dataset=%s language=%s remote_path=%s",
                 self.dataset.name,

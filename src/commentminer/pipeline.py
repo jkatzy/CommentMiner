@@ -369,12 +369,14 @@ def run_sharded_dataset(
         max_bytes_per_shard=config.storage.max_bytes_per_shard,
     )
     temp_root = writer.dataset_directory / ".tmp"
-    pending_shards = source.pending_shards()
+    pending_shards = source.iter_pending_shards()
     stats = PipelineRunStats(dataset=source.name, run_id=writer.run_id)
     failed_shards: list[FailedShard] = []
     progress_target = progress_every if progress_every > 0 else None
+    discovered_shards = 0
+    discovery_error: BaseException | None = None
     shard_progress = tqdm(
-        total=len(pending_shards),
+        total=None,
         desc=f"{source.name}:shards",
         unit="shard",
         dynamic_ncols=True,
@@ -385,7 +387,7 @@ def run_sharded_dataset(
         "Starting sharded mining run dataset=%s run_id=%s pending_shards=%s workers=%s",
         source.name,
         writer.run_id,
-        len(pending_shards),
+        "streaming",
         max_workers,
     )
 
@@ -417,10 +419,23 @@ def run_sharded_dataset(
     shard_iter = iter(pending_shards)
 
     def _submit_next(executor: ThreadPoolExecutor) -> bool:
+        nonlocal discovered_shards, discovery_error
+        if discovery_error is not None:
+            return False
         try:
             remote = next(shard_iter)
         except StopIteration:
             return False
+        except BaseException as exc:
+            discovery_error = exc
+            _LOGGER.error(
+                "Shard discovery failed dataset=%s language=%s error=%s",
+                source.name,
+                source.language or "all",
+                exc,
+            )
+            return False
+        discovered_shards += 1
         future = executor.submit(
             _process_stack_shard,
             source,
@@ -434,8 +449,9 @@ def run_sharded_dataset(
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for _ in range(min(max_workers, len(pending_shards))):
-                _submit_next(executor)
+            for _ in range(max_workers):
+                if not _submit_next(executor):
+                    break
             while futures:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -476,7 +492,7 @@ def run_sharded_dataset(
         failed_shards=failed_shards,
     )
     _LOGGER.info(
-        "Finished sharded mining run dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s shards_written=%s failed_shards=%s",
+        "Finished sharded mining run dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s shards_written=%s failed_shards=%s discovered_shards=%s",
         source.name,
         writer.run_id,
         stats.records_seen,
@@ -484,5 +500,8 @@ def run_sharded_dataset(
         stats.skipped_without_comment,
         stats.shards_written,
         stats.failed_shards,
+        discovered_shards,
     )
+    if discovery_error is not None:
+        raise discovery_error
     return stats

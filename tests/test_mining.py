@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -29,6 +30,23 @@ class FakeApi:
 
     def list_repo_tree(self, **_: object):
         return list(self._files)
+
+
+class StreamingApi:
+    def __init__(self, files: list[FakeRepoFile], download_started: threading.Event) -> None:
+        self._files = files
+        self._download_started = download_started
+
+    def list_repo_tree(self, **_: object):
+        def _iter():
+            first = True
+            for item in self._files:
+                if not first and not self._download_started.wait(timeout=1):
+                    raise AssertionError("Shard discovery did not stream ahead of worker downloads")
+                yield item
+                first = False
+
+        return _iter()
 
 
 def _write_fixture(path: Path) -> None:
@@ -233,6 +251,71 @@ class MiningTests(unittest.TestCase):
                 checkpoint["completed_files"],
                 ["data/python/bad.parquet", "data/python/good.parquet"],
             )
+
+    def test_run_sharded_dataset_starts_workers_before_full_shard_discovery_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first_fixture = root / "fixtures" / "first.parquet"
+            second_fixture = root / "fixtures" / "second.parquet"
+            _write_fixture(first_fixture)
+            _write_fixture(second_fixture)
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024 * 1024,
+                ),
+                datasets=[],
+                checkpoint_interval_records=1,
+            )
+            dataset = DatasetSpec(
+                name="the-stack",
+                source="huggingface_hub",
+                repo_id="bigcode/the-stack",
+                allow_patterns=["data/python/**"],
+                streaming=True,
+                batch_size=50,
+            )
+            files = [
+                FakeRepoFile("data/python/first.parquet", 10),
+                FakeRepoFile("data/python/second.parquet", 10),
+            ]
+            download_started = threading.Event()
+            router = FixtureRouterDownload(
+                {
+                    "data/python/first.parquet": first_fixture,
+                    "data/python/second.parquet": second_fixture,
+                }
+            )
+
+            def streaming_download(**kwargs: object) -> str:
+                download_started.set()
+                return router(**kwargs)
+
+            source = TheStackParquetSource(
+                config,
+                dataset,
+                show_progress=False,
+                downloader=HuggingFaceDownloader(
+                    api=StreamingApi(files, download_started),
+                    download_file=streaming_download,
+                ),
+            )
+
+            stats = run_sharded_dataset(
+                source,
+                ML4SEOpeningCommentExtractor,
+                config,
+                max_workers=1,
+            )
+
+            self.assertEqual(stats.records_seen, 4)
+            self.assertEqual(stats.comments_written, 2)
+            self.assertEqual(stats.failed_shards, 0)
 
 
 if __name__ == "__main__":

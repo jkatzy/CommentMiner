@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -230,6 +230,43 @@ class HuggingFaceDownloader:
             completed_files=sorted(remote_paths.intersection(completed)),
         )
 
+    def iter_pending_files(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+        max_files: int | None = None,
+        checkpoint_namespace: str = "downloads",
+    ) -> Iterator[RemoteFile]:
+        repo_id = dataset.resolve_repo_id()
+        checkpoint_store = self.checkpoint_store(config, namespace=checkpoint_namespace)
+        checkpoint = checkpoint_store.load(dataset.name, repo_id, dataset.revision, language)
+        completed = set(checkpoint.completed_files)
+        yielded = 0
+        _LOGGER.info(
+            "Streaming pending files for dataset=%s repo=%s language=%s checkpoint_namespace=%s",
+            dataset.name,
+            repo_id,
+            language or "all",
+            checkpoint_namespace,
+        )
+        for remote in self.iter_remote_files(dataset, language=language, token=token):
+            if remote.path in completed:
+                continue
+            yield remote
+            yielded += 1
+            if max_files is not None and yielded >= max_files:
+                break
+        _LOGGER.info(
+            "Finished streaming pending files for dataset=%s language=%s yielded=%s checkpoint_namespace=%s",
+            dataset.name,
+            language or "all",
+            yielded,
+            checkpoint_namespace,
+        )
+
     def list_remote_files(
         self,
         dataset: DatasetSpec,
@@ -237,6 +274,23 @@ class HuggingFaceDownloader:
         language: str | None = None,
         token: str | bool | None = None,
     ) -> list[RemoteFile]:
+        remote_files = list(self.iter_remote_files(dataset, language=language, token=token))
+        remote_files.sort(key=lambda item: item.path)
+        _LOGGER.info(
+            "Resolved %s matching remote files for dataset=%s language=%s",
+            len(remote_files),
+            dataset.name,
+            language or "all",
+        )
+        return remote_files
+
+    def iter_remote_files(
+        self,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+    ) -> Iterator[RemoteFile]:
         if dataset.source != "huggingface_hub":
             raise ValueError(f"Dataset '{dataset.name}' is not configured for Hugging Face downloads")
 
@@ -256,7 +310,6 @@ class HuggingFaceDownloader:
             token=token,
         )
 
-        remote_files: list[RemoteFile] = []
         for entry in tree:
             path = getattr(entry, "path", None)
             size_bytes = getattr(entry, "size", None)
@@ -266,16 +319,7 @@ class HuggingFaceDownloader:
                 continue
             if not _matches_none(path, ignore_patterns):
                 continue
-            remote_files.append(RemoteFile(path=path, size_bytes=size_bytes))
-
-        remote_files.sort(key=lambda item: item.path)
-        _LOGGER.info(
-            "Resolved %s matching remote files for dataset=%s language=%s",
-            len(remote_files),
-            dataset.name,
-            language or "all",
-        )
-        return remote_files
+            yield RemoteFile(path=path, size_bytes=size_bytes)
 
     def list_languages(
         self,
