@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import hashlib
 import json
 import logging
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
+
+from tqdm.auto import tqdm
 
 from .config import PipelineConfig
 from .models import CommentExtractor, CommentRecord, DatasetSource, InputRecord
+from .sources import TheStackParquetSource
 
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
@@ -61,6 +67,23 @@ class PipelineRunStats:
     comments_written: int = 0
     skipped_without_comment: int = 0
     shards_written: int = 0
+    failed_shards: int = 0
+
+
+@dataclass(slots=True)
+class CompletedShardResult:
+    remote_path: str
+    temp_output_path: Path | None
+    records_seen: int
+    comments_written: int
+    skipped_without_comment: int
+    last_record_id: str | None
+
+
+@dataclass(slots=True)
+class FailedShard:
+    shard: str
+    error: str
 
 
 class CheckpointStore:
@@ -120,6 +143,9 @@ class JsonlShardWriter:
 
     def write(self, record: CommentRecord) -> None:
         line = json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+        self.write_json_line(line)
+
+    def write_json_line(self, line: str) -> None:
         encoded = line.encode("utf-8")
 
         if self._handle is None:
@@ -160,6 +186,8 @@ def _write_run_manifest(
     stats: PipelineRunStats,
     checkpoint: DatasetCheckpoint,
     checkpoint_path: Path,
+    *,
+    failed_shards: list[FailedShard] | None = None,
 ) -> None:
     manifest = {
         "dataset": stats.dataset,
@@ -168,6 +196,7 @@ def _write_run_manifest(
         "records_seen": stats.records_seen,
         "comments_written": stats.comments_written,
         "skipped_without_comment": stats.skipped_without_comment,
+        "failed_shards": [asdict(item) for item in failed_shards or []],
         "checkpoint": checkpoint.to_dict(),
         "checkpoint_path": str(checkpoint_path),
         "shards": [path.name for path in writer.shard_paths],
@@ -248,5 +277,212 @@ def run_dataset(
         stats.comments_written,
         stats.skipped_without_comment,
         stats.shards_written,
+    )
+    return stats
+
+
+def _temp_output_path(temp_root: Path, remote_path: str) -> Path:
+    digest = hashlib.sha1(remote_path.encode("utf-8")).hexdigest()[:12]
+    return temp_root / f"{_slugify(remote_path)}-{digest}.jsonl"
+
+
+def _write_json_line(handle, record: CommentRecord) -> None:
+    handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+
+
+def _merge_temp_output(writer: JsonlShardWriter, temp_output_path: Path | None) -> None:
+    if temp_output_path is None or not temp_output_path.exists():
+        return
+    with temp_output_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            writer.write_json_line(line)
+    temp_output_path.unlink()
+
+
+def _process_stack_shard(
+    source: TheStackParquetSource,
+    remote,
+    extractor_factory: Callable[[], CommentExtractor],
+    temp_root: Path,
+    *,
+    show_progress: bool,
+) -> CompletedShardResult:
+    extractor = extractor_factory()
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_output_path = _temp_output_path(temp_root, remote.path)
+    handle = None
+    records_seen = 0
+    comments_written = 0
+    skipped_without_comment = 0
+    last_record_id: str | None = None
+    try:
+        for record in source.iter_shard_records(remote, show_progress=show_progress):
+            records_seen += 1
+            last_record_id = record.record_id
+            comment = _normalize_comment(extractor.extract_opening_comment(record))
+            if comment is None:
+                skipped_without_comment += 1
+                continue
+            if handle is None:
+                handle = temp_output_path.open("w", encoding="utf-8")
+            _write_json_line(handle, _build_comment_record(record, comment))
+            comments_written += 1
+        return CompletedShardResult(
+            remote_path=remote.path,
+            temp_output_path=temp_output_path if comments_written > 0 else None,
+            records_seen=records_seen,
+            comments_written=comments_written,
+            skipped_without_comment=skipped_without_comment,
+            last_record_id=last_record_id,
+        )
+    except Exception:
+        if handle is not None:
+            handle.close()
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise
+    finally:
+        if handle is not None and not handle.closed:
+            handle.close()
+        if comments_written == 0 and temp_output_path.exists():
+            temp_output_path.unlink()
+
+
+def run_sharded_dataset(
+    source: TheStackParquetSource,
+    extractor_factory: Callable[[], CommentExtractor],
+    config: PipelineConfig,
+    *,
+    max_workers: int = 1,
+    progress_every: int = 1000,
+) -> PipelineRunStats:
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+
+    config.ensure_directories()
+    checkpoint_store = CheckpointStore(config.storage.checkpoint_directory)
+    checkpoint = checkpoint_store.load(source.name)
+    writer = JsonlShardWriter(
+        config.storage.output_directory,
+        source.name,
+        max_records_per_shard=config.storage.max_records_per_shard,
+        max_bytes_per_shard=config.storage.max_bytes_per_shard,
+    )
+    temp_root = writer.dataset_directory / ".tmp"
+    pending_shards = source.pending_shards()
+    stats = PipelineRunStats(dataset=source.name, run_id=writer.run_id)
+    failed_shards: list[FailedShard] = []
+    progress_target = progress_every if progress_every > 0 else None
+    shard_progress = tqdm(
+        total=len(pending_shards),
+        desc=f"{source.name}:shards",
+        unit="shard",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not source.show_progress or max_workers <= 1,
+    )
+    _LOGGER.info(
+        "Starting sharded mining run dataset=%s run_id=%s pending_shards=%s workers=%s",
+        source.name,
+        writer.run_id,
+        len(pending_shards),
+        max_workers,
+    )
+
+    def _update_success(remote, result: CompletedShardResult) -> None:
+        nonlocal progress_target
+        _merge_temp_output(writer, result.temp_output_path)
+        source.mark_shard_completed(remote)
+        stats.records_seen += result.records_seen
+        stats.comments_written += result.comments_written
+        stats.skipped_without_comment += result.skipped_without_comment
+        checkpoint.records_seen += result.records_seen
+        checkpoint.comments_written += result.comments_written
+        checkpoint.last_record_id = result.last_record_id
+        checkpoint_store.save(checkpoint)
+        if progress_target is not None and stats.records_seen >= progress_target:
+            _LOGGER.info(
+                "Mining progress dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s last_record_id=%s",
+                source.name,
+                writer.run_id,
+                stats.records_seen,
+                stats.comments_written,
+                stats.skipped_without_comment,
+                checkpoint.last_record_id,
+            )
+            while stats.records_seen >= progress_target:
+                progress_target += progress_every
+
+    futures: dict[Future[CompletedShardResult], object] = {}
+    shard_iter = iter(pending_shards)
+
+    def _submit_next(executor: ThreadPoolExecutor) -> bool:
+        try:
+            remote = next(shard_iter)
+        except StopIteration:
+            return False
+        future = executor.submit(
+            _process_stack_shard,
+            source,
+            remote,
+            extractor_factory,
+            temp_root,
+            show_progress=source.show_progress and max_workers == 1,
+        )
+        futures[future] = remote
+        return True
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for _ in range(min(max_workers, len(pending_shards))):
+                _submit_next(executor)
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    remote = futures.pop(future)
+                    shard_progress.update(1)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        source.note_shard_failure(remote, exc)
+                        failed_shards.append(FailedShard(shard=remote.path, error=str(exc)))
+                    else:
+                        _LOGGER.info(
+                            "Finished shard dataset=%s remote_path=%s records_seen=%s comments_written=%s skipped_without_comment=%s",
+                            source.name,
+                            result.remote_path,
+                            result.records_seen,
+                            result.comments_written,
+                            result.skipped_without_comment,
+                        )
+                        _update_success(remote, result)
+                    _submit_next(executor)
+    finally:
+        shard_progress.close()
+        checkpoint_path = checkpoint_store.save(checkpoint)
+        writer.close()
+        if temp_root.exists():
+            for path in temp_root.iterdir():
+                path.unlink()
+            temp_root.rmdir()
+
+    stats.shards_written = len(writer.shard_paths)
+    stats.failed_shards = len(failed_shards)
+    _write_run_manifest(
+        writer,
+        stats,
+        checkpoint,
+        checkpoint_path,
+        failed_shards=failed_shards,
+    )
+    _LOGGER.info(
+        "Finished sharded mining run dataset=%s run_id=%s records_seen=%s comments_written=%s skipped_without_comment=%s shards_written=%s failed_shards=%s",
+        source.name,
+        writer.run_id,
+        stats.records_seen,
+        stats.comments_written,
+        stats.skipped_without_comment,
+        stats.shards_written,
+        stats.failed_shards,
     )
     return stats

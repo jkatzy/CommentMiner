@@ -13,6 +13,12 @@ PROGRESS_EVERY="${COMMENTMINER_PROGRESS_EVERY:-1000}"
 MAX_COMMENT_START_ROW="${COMMENTMINER_MAX_COMMENT_START_ROW:-3}"
 TOKEN_ENV="${COMMENTMINER_TOKEN_ENV:-}"
 NO_TQDM="${COMMENTMINER_NO_TQDM:-0}"
+if command -v nproc >/dev/null 2>&1; then
+  DEFAULT_WORKERS="$(nproc)"
+else
+  DEFAULT_WORKERS=4
+fi
+WORKERS="${COMMENTMINER_WORKERS:-$DEFAULT_WORKERS}"
 
 declare -a TEMP_CONFIGS=()
 declare -a FAILED_LANGUAGES=()
@@ -85,6 +91,7 @@ run_language() {
     "$temp_config"
     "$DATASET_NAME"
     --language "$language"
+    --workers "$WORKERS"
     --progress-every "$PROGRESS_EVERY"
     --max-comment-start-row "$MAX_COMMENT_START_ROW"
   )
@@ -98,6 +105,7 @@ run_language() {
   echo "=== Starting language: $language ==="
   echo "Output root: $OUTPUT_ROOT/$language/the-stack"
   echo "State root:  $STATE_ROOT/$language"
+  echo "Workers:     $WORKERS"
 
   if "${cmd[@]}"; then
     echo "=== Completed language: $language ==="

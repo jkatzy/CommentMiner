@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 from commentminer.config import DatasetSpec, PipelineConfig, StorageConfig
 from commentminer.downloader import HuggingFaceDownloader
 from commentminer.extractors import ML4SEOpeningCommentExtractor
-from commentminer.pipeline import run_dataset
+from commentminer.pipeline import run_sharded_dataset
 from commentminer.sources import TheStackParquetSource
 
 
@@ -66,8 +66,22 @@ def _copy_fixture_download(**kwargs: object) -> str:
     return str(target_path)
 
 
+class FixtureRouterDownload:
+    def __init__(self, mapping: dict[str, Path]) -> None:
+        self.mapping = mapping
+
+    def __call__(self, **kwargs: object) -> str:
+        filename = str(kwargs["filename"])
+        fixture_path = self.mapping[filename]
+        local_dir = Path(str(kwargs["local_dir"]))
+        target_path = local_dir / filename
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(fixture_path, target_path)
+        return str(target_path)
+
+
 class MiningTests(unittest.TestCase):
-    def test_run_dataset_writes_comment_without_content_and_keeps_metadata(self) -> None:
+    def test_run_sharded_dataset_writes_comment_without_content_and_keeps_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             fixture_path = root / "fixtures" / "train.parquet"
@@ -104,12 +118,17 @@ class MiningTests(unittest.TestCase):
                     download_file=_copy_fixture_download,
                 ),
             )
-            extractor = ML4SEOpeningCommentExtractor()
 
-            stats = run_dataset(source, extractor, config)
+            stats = run_sharded_dataset(
+                source,
+                ML4SEOpeningCommentExtractor,
+                config,
+                max_workers=1,
+            )
 
             self.assertEqual(stats.records_seen, 2)
             self.assertEqual(stats.comments_written, 1)
+            self.assertEqual(stats.failed_shards, 0)
             shard_path = next(config.storage.output_directory.rglob("part-00000.jsonl"))
             payload = json.loads(shard_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(payload["opening_comment"], "# first comment\n# second line")
@@ -117,6 +136,103 @@ class MiningTests(unittest.TestCase):
             self.assertEqual(payload["metadata"]["hexsha"], "a1")
             self.assertEqual(payload["metadata"]["ext"], "python")
             self.assertEqual(payload["path"], "src/a.py")
+
+    def test_run_sharded_dataset_skips_failed_shard_and_reruns_missing_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            good_fixture = root / "fixtures" / "good.parquet"
+            repaired_fixture = root / "fixtures" / "repaired.parquet"
+            bad_fixture = root / "fixtures" / "bad.parquet"
+            _write_fixture(good_fixture)
+            _write_fixture(repaired_fixture)
+            bad_fixture.parent.mkdir(parents=True, exist_ok=True)
+            bad_fixture.write_text("not parquet", encoding="utf-8")
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024 * 1024,
+                ),
+                datasets=[],
+                checkpoint_interval_records=1,
+            )
+            dataset = DatasetSpec(
+                name="the-stack",
+                source="huggingface_hub",
+                repo_id="bigcode/the-stack",
+                allow_patterns=["data/python/**"],
+                streaming=True,
+                batch_size=50,
+            )
+            files = [
+                FakeRepoFile("data/python/bad.parquet", 10),
+                FakeRepoFile("data/python/good.parquet", 10),
+            ]
+
+            failing_source = TheStackParquetSource(
+                config,
+                dataset,
+                show_progress=False,
+                downloader=HuggingFaceDownloader(
+                    api=FakeApi(files),
+                    download_file=FixtureRouterDownload(
+                        {
+                            "data/python/bad.parquet": bad_fixture,
+                            "data/python/good.parquet": good_fixture,
+                        }
+                    ),
+                ),
+            )
+
+            first_stats = run_sharded_dataset(
+                failing_source,
+                ML4SEOpeningCommentExtractor,
+                config,
+                max_workers=2,
+            )
+
+            self.assertEqual(first_stats.records_seen, 2)
+            self.assertEqual(first_stats.comments_written, 1)
+            self.assertEqual(first_stats.failed_shards, 1)
+            checkpoint_path = root / "checkpoints" / "processed-shards" / "the-stack.json"
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["completed_files"], ["data/python/good.parquet"])
+
+            repaired_source = TheStackParquetSource(
+                config,
+                dataset,
+                show_progress=False,
+                downloader=HuggingFaceDownloader(
+                    api=FakeApi(files),
+                    download_file=FixtureRouterDownload(
+                        {
+                            "data/python/bad.parquet": repaired_fixture,
+                            "data/python/good.parquet": good_fixture,
+                        }
+                    ),
+                ),
+            )
+
+            second_stats = run_sharded_dataset(
+                repaired_source,
+                ML4SEOpeningCommentExtractor,
+                config,
+                max_workers=2,
+            )
+
+            self.assertEqual(second_stats.records_seen, 2)
+            self.assertEqual(second_stats.comments_written, 1)
+            self.assertEqual(second_stats.failed_shards, 0)
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                checkpoint["completed_files"],
+                ["data/python/bad.parquet", "data/python/good.parquet"],
+            )
 
 
 if __name__ == "__main__":

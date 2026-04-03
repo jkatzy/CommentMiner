@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 from typing import Any, Iterator
 
 import pyarrow.parquet as pq
@@ -51,6 +52,67 @@ class TheStackParquetSource:
         self.show_progress = show_progress
         self.token = token
         self.downloader = downloader or HuggingFaceDownloader()
+        self.failed_shards: list[str] = []
+
+    def pending_shards(self) -> list[RemoteFile]:
+        self.config.ensure_directories()
+        self.failed_shards = []
+        plan = self.downloader.plan_download(
+            self.config,
+            self.dataset,
+            language=self.language,
+            token=self.token,
+            checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
+        )
+        return list(plan.pending_files)
+
+    def iter_shard_records(
+        self,
+        remote: RemoteFile,
+        *,
+        show_progress: bool | None = None,
+    ) -> Iterator[InputRecord]:
+        local_path = self.downloader.download_remote_file(
+            self.config,
+            self.dataset,
+            remote.path,
+            language=self.language,
+            token=self.token,
+        )
+        try:
+            yield from self._iter_file_records(
+                remote,
+                local_path,
+                None,
+                show_progress=show_progress,
+            )
+        finally:
+            if self.dataset.streaming:
+                self.downloader.remove_local_file(
+                    self.config,
+                    self.dataset,
+                    remote.path,
+                    language=self.language,
+                )
+
+    def mark_shard_completed(self, remote: RemoteFile) -> Path:
+        return self.downloader.mark_file_completed(
+            self.config,
+            self.dataset,
+            remote.path,
+            language=self.language,
+            checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
+        )
+
+    def note_shard_failure(self, remote: RemoteFile, exc: BaseException) -> None:
+        self.failed_shards.append(remote.path)
+        _LOGGER.error(
+            "Shard processing failed dataset=%s language=%s remote_path=%s error=%s",
+            self.dataset.name,
+            self.language or "all",
+            remote.path,
+            exc,
+        )
 
     def iter_records(self, start_after: str | None = None) -> Iterator[InputRecord]:
         self.config.ensure_directories()
@@ -116,6 +178,8 @@ class TheStackParquetSource:
         remote: RemoteFile,
         local_path: Any,
         resume_cursor: ShardRowCursor | None,
+        *,
+        show_progress: bool | None = None,
     ) -> Iterator[InputRecord]:
         start_row = 0
         if resume_cursor and resume_cursor.remote_path == remote.path:
@@ -137,7 +201,7 @@ class TheStackParquetSource:
             unit="rows",
             dynamic_ncols=True,
             leave=False,
-            disable=not self.show_progress,
+            disable=not (self.show_progress if show_progress is None else show_progress),
         )
         row_index = 0
         try:

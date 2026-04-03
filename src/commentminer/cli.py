@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import json
+import logging
 import os
 from pathlib import Path
+import sys
 from typing import Sequence
 
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -13,8 +15,11 @@ from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .extractors import ML4SEOpeningCommentExtractor
 from .logging_utils import configure_logging
-from .pipeline import run_dataset
+from .pipeline import run_dataset, run_sharded_dataset
 from .sources import TheStackParquetSource
+
+_DEFAULT_WORKERS = max(1, min(2, os.cpu_count() or 1))
+_LOGGER = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tqdm",
         action="store_true",
         help="Disable per-shard tqdm progress bars during parquet streaming.",
+    )
+    mine.add_argument(
+        "--workers",
+        type=int,
+        default=_DEFAULT_WORKERS,
+        help="Number of shard workers for shard-atomic mining. Values above 1 allow out-of-order shard completion.",
     )
 
     return parser
@@ -271,6 +282,7 @@ def _mine_dataset(
     max_records: int | None,
     max_comment_start_row: int,
     progress_every: int,
+    workers: int,
 ) -> int:
     config = PipelineConfig.from_path(config_path)
     dataset, source = _build_source(
@@ -280,22 +292,40 @@ def _mine_dataset(
         show_progress=show_progress,
         token_env=token_env,
     )
-    extractor = ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row)
     logging_context = logging_redirect_tqdm() if show_progress else nullcontext()
-    with logging_context:
-        stats = run_dataset(
-            source,
-            extractor,
-            config,
-            max_records=max_records,
-            progress_every=progress_every,
-        )
+    if isinstance(source, TheStackParquetSource) and max_records is None:
+        with logging_context:
+            stats = run_sharded_dataset(
+                source,
+                lambda: ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row),
+                config,
+                max_workers=workers,
+                progress_every=progress_every,
+            )
+    else:
+        if max_records is not None:
+            warning = (
+                f"WARNING: --max-records={max_records} uses sequential record-level mining"
+                f"{' and ignores --workers' if workers != 1 else ''}"
+                " to preserve an exact sample size."
+            )
+            print(warning, file=sys.stderr)
+        extractor = ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row)
+        with logging_context:
+            stats = run_dataset(
+                source,
+                extractor,
+                config,
+                max_records=max_records,
+                progress_every=progress_every,
+            )
     print(f"Dataset: {dataset.name}")
     print(f"Language: {language or 'all'}")
     print(f"Records seen: {stats.records_seen}")
     print(f"Comments written: {stats.comments_written}")
     print(f"Skipped without comment: {stats.skipped_without_comment}")
     print(f"Shards written: {stats.shards_written}")
+    print(f"Failed shards: {stats.failed_shards}")
     return 0
 
 
@@ -342,6 +372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_records=args.max_records,
                 max_comment_start_row=args.max_comment_start_row,
                 progress_every=args.progress_every,
+                workers=args.workers,
             )
     except (KeyError, ValueError) as exc:
         parser.exit(status=2, message=f"{exc}\n")
