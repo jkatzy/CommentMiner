@@ -1,6 +1,6 @@
 # CommentMiner
 
-CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack, The Stack v2, and related corpora. The repository focuses on orchestration: reading remote dataset files, passing source records through an external comment extractor, normalizing the results into one schema, and writing resumable output shards.
+CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack and related corpora. The repository focuses on orchestration: downloading remote dataset shards, passing source records through an external comment extractor, normalizing the results into one schema, and then post-processing the extracted comments with license detection.
 
 The actual comment extraction logic is intentionally out of scope here. That will be provided by `ml4se-tk`, and this repository will integrate that extractor rather than reimplementing it.
 
@@ -60,7 +60,30 @@ Add new development-only dependencies:
 uv add --dev <package>
 ```
 
-## Hugging Face Downloads
+## Pipeline Overview
+
+The current production pipeline has three stages:
+
+1. Download or stream dataset shards from Hugging Face.
+2. Extract opening comments and save only the comment plus row metadata.
+3. Run ScanCode over the extracted comments to detect license notices.
+
+The stages are intentionally separate:
+
+- download state is checkpointed independently from mined output
+- comment extraction writes a clean dataset that excludes source code content
+- license scanning runs only on the extracted comments, not on the raw code files
+
+Typical data flow:
+
+```text
+Hugging Face dataset files
+-> local shard download / streaming checkpoint
+-> extracted comment JSONL shards
+-> ScanCode-enriched JSONL shards
+```
+
+## Stage 1: Download
 
 The downloader is designed for large dataset repos on the Hugging Face Hub:
 
@@ -75,13 +98,24 @@ There are now two distinct modes:
 - `commentminer download ...`: explicitly save selected Hub files locally
 - `TheStackParquetSource`: download one parquet shard, iterate its rows, checkpoint progress, and delete the shard when processing finishes
 
-## Comment Extraction
+Useful commands:
+
+```bash
+uv run commentminer list-languages config/the-stack.sample.json the-stack
+uv run commentminer plan-download config/the-stack.sample.json the-stack --language python --max-files 1
+uv run commentminer download config/the-stack.sample.json the-stack --language python --max-files 1
+```
+
+Use `plan-download` when you want to inspect what would be fetched before running a job. Use `download` when you explicitly want local copies of the upstream shard files.
+
+## Stage 2: Comment Extraction
 
 Opening comment extraction is integrated through `ml4setk.OpeningCommentQuery`.
 This repository uses that query directly through `ML4SEOpeningCommentExtractor`.
 
-Mine a configured The Stack language slice and write only extracted comments plus
-row metadata to JSONL shards:
+The mining stage is the main production step. For The Stack, it downloads one shard, extracts comments row by row, writes extracted output, checkpoints progress, and removes the local shard when processing finishes.
+
+Mine a configured The Stack language slice and write only extracted comments plus row metadata to JSONL shards:
 
 ```bash
 uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
@@ -101,35 +135,15 @@ The saved output excludes the source `content` field. It keeps:
 - canonical fields such as `dataset`, `record_id`, `language`, `path`, and `repo`
 - all non-content row metadata in the `metadata` object
 
-Inspect configured language choices:
+The mined dataset is written under:
 
-```bash
-uv run commentminer list-languages config/pipeline.example.json the-stack-v2
+```text
+var/output/<dataset>/<run_id>/part-xxxxx.jsonl
 ```
 
-When a dataset config does not pin a fixed `languages` list, `list-languages` now discovers language names from the Hugging Face repo layout.
+Each run directory also includes a `manifest.json` describing what was processed.
 
-Preview the files that would be downloaded:
-
-```bash
-uv run commentminer plan-download config/pipeline.example.json the-stack-v2 --language python
-```
-
-Run a resumable download:
-
-```bash
-uv run commentminer download config/pipeline.example.json the-stack-v2 --language python
-```
-
-The repository also includes a concrete The Stack sample config:
-
-```bash
-uv run commentminer list-languages config/the-stack.sample.json the-stack
-uv run commentminer plan-download config/the-stack.sample.json the-stack --language befunge --max-files 1
-uv run commentminer download config/the-stack.sample.json the-stack --language befunge --max-files 1
-```
-
-## License Scanning
+## Stage 3: License Scanning
 
 Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments.
 
@@ -146,7 +160,7 @@ Example:
 
 ```bash
 uv run commentminer scan-comment-licenses \
-  var/output/redpajama-github/20260407T114500Z \
+  var/output/the-stack/20260407T114500Z \
   --scancode scancode \
   --batch-size 500 \
   --min-license-score 95 \
@@ -155,23 +169,53 @@ uv run commentminer scan-comment-licenses \
 
 The enriched output is written by default to a sibling directory named `<input-run>-license-scan`.
 
+For example, scanning:
+
+```text
+var/output/the-stack/20260407T114500Z
+```
+
+produces:
+
+```text
+var/output/the-stack/20260407T114500Z-license-scan
+```
+
 The default ScanCode settings now match the existing Stack v2 pipeline:
 
 - `scancode --quiet --license --json-pp`
 - classify a comment as containing license text only when `score >= 95` and `match_coverage >= 95`
+
 For private repos, pass a token through an environment variable:
 
 ```bash
-uv run commentminer download config/pipeline.example.json the-stack-v2 --token-env HF_TOKEN
+uv run commentminer download config/the-stack.sample.json the-stack --token-env HF_TOKEN
 ```
+
+## End-To-End Example
+
+One minimal end-to-end flow for a small The Stack slice looks like this:
+
+```bash
+uv sync
+uv run commentminer plan-download config/the-stack.sample.json the-stack --language ampl --max-files 1
+uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
+uv run commentminer scan-comment-licenses var/output/the-stack/<run_id> --scancode scancode
+```
+
+That produces:
+
+- raw download/checkpoint state under `var/downloads/` and `var/checkpoints/`
+- extracted comments under `var/output/the-stack/<run_id>/`
+- ScanCode-enriched comments under `var/output/the-stack/<run_id>-license-scan/`
 
 ## Baseline Workflow
 
 1. Define dataset sources in a config file.
-2. Build a source adapter that yields normalized input records.
-3. Plug in the `ml4se-tk` opening-comment extractor.
-4. Run the pipeline to emit JSONL shards plus checkpoints and run manifests.
-5. Merge or post-process shards into the final dataset format.
+2. Resolve or inspect the shard files that will be downloaded.
+3. Run comment extraction to emit JSONL shards plus checkpoints and run manifests.
+4. Post-process the extracted comment shards with ScanCode.
+5. Merge or analyze the resulting comment dataset.
 
 ## Current Status
 
@@ -182,4 +226,5 @@ The repository currently includes:
 - shard-at-a-time The Stack parquet processing with bounded local storage
 - `ml4setk.OpeningCommentQuery` integration for opening-comment extraction
 - JSONL output sharding that keeps row metadata but excludes source code content
+- post-processing license detection over extracted comments using ScanCode
 - runtime logging plus shard-level `tqdm` progress during streaming
