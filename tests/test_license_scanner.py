@@ -128,6 +128,18 @@ def _fake_scancode_runner(**kwargs):
 
 
 class LicenseScannerTests(unittest.TestCase):
+    def test_scan_comment_licenses_rejects_in_place_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_directory = _write_input_run(root)
+
+            with self.assertRaisesRegex(ValueError, "Output directory must differ"):
+                scan_comment_licenses(
+                    input_directory,
+                    output_directory=input_directory,
+                    runner=_fake_scancode_runner,
+                )
+
     def test_scan_comment_licenses_writes_enriched_output_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
