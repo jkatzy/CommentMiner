@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from commentminer.config import DatasetSpec, PipelineConfig, StorageConfig
-from commentminer.downloader import HuggingFaceDownloader
+from commentminer.downloader import HuggingFaceDownloader, RedPajamaManifestDownloader
 
 
 @dataclass
@@ -31,6 +31,19 @@ def fake_download_file(**kwargs: object) -> str:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text("payload", encoding="utf-8")
     return str(target_path)
+
+
+def fake_manifest_download_factory(manifest_path: Path):
+    def _download(**_: object) -> str:
+        return str(manifest_path)
+
+    return _download
+
+
+def fake_remote_download(url: str, target_path: Path) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(f"downloaded:{url}", encoding="utf-8")
+    return target_path
 
 
 class HuggingFaceDownloaderTests(unittest.TestCase):
@@ -174,6 +187,79 @@ class HuggingFaceDownloaderTests(unittest.TestCase):
             )
 
             second_summary = downloader.download(config, config.require_dataset("the-stack"))
+            self.assertEqual(second_summary.already_downloaded_count, 2)
+            self.assertEqual(second_summary.downloaded_count, 0)
+
+    def test_redpajama_manifest_download_uses_url_manifest_and_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = root / "github.txt"
+            manifest_path.write_text(
+                "\n".join(
+                    [
+                        "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/shard-000.jsonl",
+                        "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/shard-001.jsonl",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024,
+                ),
+                datasets=[
+                    DatasetSpec(
+                        name="redpajama-github",
+                        source="redpajama_manifest",
+                        repo_id="togethercomputer/RedPajama-Data-1T",
+                        repo_type="dataset",
+                        revision="main",
+                        streaming=True,
+                        extra={"manifest_path": "urls/github.txt"},
+                    )
+                ],
+                checkpoint_interval_records=1,
+            )
+            downloader = RedPajamaManifestDownloader(
+                manifest_download_file=fake_manifest_download_factory(manifest_path),
+                remote_download_file=fake_remote_download,
+            )
+
+            plan = downloader.plan_download(config, config.require_dataset("redpajama-github"))
+
+            self.assertEqual(plan.matched_count, 2)
+            self.assertEqual(plan.pending_count, 2)
+            self.assertEqual(plan.completed_count, 0)
+
+            summary = downloader.download(config, config.require_dataset("redpajama-github"))
+
+            self.assertEqual(summary.matched_count, 2)
+            self.assertEqual(summary.downloaded_count, 2)
+            self.assertTrue(
+                (
+                    summary.download_root
+                    / "redpajama-data-1T"
+                    / "v1.0.0"
+                    / "github"
+                    / "shard-000.jsonl"
+                ).exists()
+            )
+            checkpoint = json.loads(summary.checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                checkpoint["completed_files"],
+                [
+                    "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/shard-000.jsonl",
+                    "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/shard-001.jsonl",
+                ],
+            )
+
+            second_summary = downloader.download(config, config.require_dataset("redpajama-github"))
             self.assertEqual(second_summary.already_downloaded_count, 2)
             self.assertEqual(second_summary.downloaded_count, 0)
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Protocol
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,35 @@ class DatasetSource(Protocol):
 
     def iter_records(self, start_after: str | None = None) -> Iterable[InputRecord]:
         """Yield records, optionally resuming after a record identifier."""
+
+
+@runtime_checkable
+class ShardedDatasetSource(DatasetSource, Protocol):
+    dataset: Any
+    downloader: Any
+    language: str | None
+    token: str | bool | None
+    show_progress: bool
+
+    def pending_shards(self) -> list[Any]:
+        """Return shard descriptors that still need to be processed."""
+
+    def iter_pending_shards(self) -> Iterator[Any]:
+        """Stream shard descriptors that still need to be processed."""
+
+    def iter_shard_records(
+        self,
+        remote: Any,
+        *,
+        show_progress: bool | None = None,
+    ) -> Iterable[InputRecord]:
+        """Yield records from one shard."""
+
+    def mark_shard_completed(self, remote: Any) -> Path:
+        """Persist shard completion state and return the checkpoint path."""
+
+    def note_shard_failure(self, remote: Any, exc: BaseException) -> None:
+        """Record a shard failure without aborting the entire run."""
 
 
 class CommentExtractor(Protocol):

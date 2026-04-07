@@ -1,6 +1,6 @@
 # CommentMiner
 
-CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack, The Stack v2, and related corpora. The repository focuses on orchestration: reading remote dataset files, passing source records through an external comment extractor, normalizing the results into one schema, and writing resumable output shards.
+CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack, The Stack v2, RedPajama GitHub, and related corpora. The repository focuses on orchestration: reading remote dataset files, passing source records through an external comment extractor, normalizing the results into one schema, and writing resumable output shards.
 
 The actual comment extraction logic is intentionally out of scope here. That will be provided by `ml4se-tk`, and this repository will integrate that extractor rather than reimplementing it.
 
@@ -74,6 +74,7 @@ There are now two distinct modes:
 
 - `commentminer download ...`: explicitly save selected Hub files locally
 - `TheStackParquetSource`: download one parquet shard, iterate its rows, checkpoint progress, and delete the shard when processing finishes
+- `RedPajamaGithubSource`: download one JSONL shard from the Hugging Face-hosted GitHub manifest, iterate its rows, checkpoint progress, and delete the shard when processing finishes
 
 ## Comment Extraction
 
@@ -128,6 +129,20 @@ uv run commentminer list-languages config/the-stack.sample.json the-stack
 uv run commentminer plan-download config/the-stack.sample.json the-stack --language befunge --max-files 1
 uv run commentminer download config/the-stack.sample.json the-stack --language befunge --max-files 1
 ```
+
+For RedPajama GitHub, use the manifest-backed sample config:
+
+```bash
+uv run commentminer plan-download config/redpajama-github.sample.json redpajama-github --max-files 1
+uv run commentminer mine-dataset config/redpajama-github.sample.json redpajama-github --language python --workers 2
+```
+
+RedPajama is structurally different from The Stack:
+
+- Hugging Face hosts a manifest file of GitHub shard URLs rather than the shard payloads directly
+- shard downloads are still checkpointed and cleaned up locally
+- `--language` on `mine-dataset` filters rows during mining when RedPajama metadata exposes a usable language signal
+- `--language` does not reduce which RedPajama shard files must be fetched
 
 For private repos, pass a token through an environment variable:
 

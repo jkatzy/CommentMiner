@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Iterator
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -43,6 +45,29 @@ def _compile_language_pattern(pattern: str) -> re.Pattern[str]:
     return re.compile(
         translated.replace(_LANGUAGE_PLACEHOLDER, r"(?P<language>[^/]+)")
     )
+
+
+def _download_url_to_path(url: str, target_path: Path) -> Path:
+    temp_path = target_path.with_suffix(target_path.suffix + ".part")
+    try:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; CommentMiner/0.1)",
+            },
+        )
+        with urlopen(request) as response, temp_path.open("wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        temp_path.replace(target_path)
+        return target_path
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,3 +591,311 @@ class HuggingFaceDownloader:
         if language:
             root = root / _slugify(language)
         return root
+
+
+class RedPajamaManifestDownloader:
+    def __init__(
+        self,
+        *,
+        manifest_download_file: Callable[..., str] | None = None,
+        remote_download_file: Callable[[str, Path], Path] | None = None,
+    ) -> None:
+        self.manifest_download_file = manifest_download_file or hf_hub_download
+        self.remote_download_file = remote_download_file or _download_url_to_path
+
+    def supports_subprocess_workers(self) -> bool:
+        return (
+            self.manifest_download_file is hf_hub_download
+            and self.remote_download_file is _download_url_to_path
+        )
+
+    def plan_download(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+        max_files: int | None = None,
+        checkpoint_namespace: str = "downloads",
+    ) -> DownloadPlan:
+        repo_id = dataset.resolve_repo_id()
+        checkpoint_store = self.checkpoint_store(config, namespace=checkpoint_namespace)
+        checkpoint = checkpoint_store.load(dataset.name, repo_id, dataset.revision, language)
+        remote_files = self.list_remote_files(config, dataset, token=token)
+        completed = set(checkpoint.completed_files)
+        remote_paths = {remote.path for remote in remote_files}
+        pending_files = [remote for remote in remote_files if remote.path not in completed]
+        if max_files is not None:
+            pending_files = pending_files[:max_files]
+
+        return DownloadPlan(
+            dataset=dataset.name,
+            repo_id=repo_id,
+            revision=dataset.revision,
+            language=language,
+            download_root=self._download_root(config, dataset),
+            checkpoint_path=checkpoint_store.path_for(dataset.name, language),
+            cache_directory=config.storage.huggingface_cache_directory,
+            allow_patterns=[self._manifest_path(dataset)],
+            ignore_patterns=[],
+            matched_files=remote_files,
+            pending_files=pending_files,
+            completed_files=sorted(remote_paths.intersection(completed)),
+        )
+
+    def iter_pending_files(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+        max_files: int | None = None,
+        checkpoint_namespace: str = "downloads",
+    ) -> Iterator[RemoteFile]:
+        del language
+        repo_id = dataset.resolve_repo_id()
+        checkpoint_store = self.checkpoint_store(config, namespace=checkpoint_namespace)
+        checkpoint = checkpoint_store.load(dataset.name, repo_id, dataset.revision, None)
+        completed = set(checkpoint.completed_files)
+        yielded = 0
+        for remote in self.iter_remote_files(config, dataset, token=token):
+            if remote.path in completed:
+                continue
+            yield remote
+            yielded += 1
+            if max_files is not None and yielded >= max_files:
+                break
+
+    def list_remote_files(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None = None,
+    ) -> list[RemoteFile]:
+        remote_files = list(self.iter_remote_files(config, dataset, token=token))
+        _LOGGER.info(
+            "Resolved %s manifest-backed remote files for dataset=%s repo=%s",
+            len(remote_files),
+            dataset.name,
+            dataset.resolve_repo_id(),
+        )
+        return remote_files
+
+    def iter_remote_files(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None = None,
+    ) -> Iterator[RemoteFile]:
+        manifest_path = self._fetch_manifest(config, dataset, token=token)
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            url = line.strip()
+            if not url:
+                continue
+            yield RemoteFile(path=url)
+
+    def checkpoint_store(
+        self,
+        config: PipelineConfig,
+        *,
+        namespace: str = "downloads",
+    ) -> DownloadCheckpointStore:
+        return DownloadCheckpointStore(config.storage.checkpoint_directory / namespace)
+
+    def load_checkpoint(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        checkpoint_namespace: str = "downloads",
+    ) -> DownloadCheckpoint:
+        return self.checkpoint_store(config, namespace=checkpoint_namespace).load(
+            dataset.name,
+            dataset.resolve_repo_id(),
+            dataset.revision,
+            language,
+        )
+
+    def save_checkpoint(
+        self,
+        config: PipelineConfig,
+        checkpoint: DownloadCheckpoint,
+        *,
+        checkpoint_namespace: str = "downloads",
+    ) -> Path:
+        return self.checkpoint_store(config, namespace=checkpoint_namespace).save(checkpoint)
+
+    def download_remote_file(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        remote_path: str,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+    ) -> Path:
+        del language, token
+        local_path = self._download_root(config, dataset) / self._relative_path_for_url(remote_path)
+        if local_path.exists():
+            return local_path
+
+        _LOGGER.info(
+            "Downloading manifest-backed remote file dataset=%s path=%s",
+            dataset.name,
+            remote_path,
+        )
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_path = self.remote_download_file(remote_path, local_path)
+        _LOGGER.info(
+            "Finished manifest-backed download dataset=%s path=%s local_path=%s",
+            dataset.name,
+            remote_path,
+            downloaded_path,
+        )
+        return downloaded_path
+
+    def mark_file_completed(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        remote_path: str,
+        *,
+        language: str | None = None,
+        checkpoint_namespace: str = "downloads",
+    ) -> Path:
+        checkpoint = self.load_checkpoint(
+            config,
+            dataset,
+            language=language,
+            checkpoint_namespace=checkpoint_namespace,
+        )
+        if remote_path not in checkpoint.completed_files:
+            checkpoint.completed_files.append(remote_path)
+        checkpoint.last_downloaded_file = remote_path
+        return self.save_checkpoint(
+            config,
+            checkpoint,
+            checkpoint_namespace=checkpoint_namespace,
+        )
+
+    def remove_local_file(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        remote_path: str,
+        *,
+        language: str | None = None,
+    ) -> None:
+        del language
+        local_path = self._download_root(config, dataset) / self._relative_path_for_url(remote_path)
+        if not local_path.exists():
+            return
+        _LOGGER.info(
+            "Removing local shard dataset=%s path=%s",
+            dataset.name,
+            local_path,
+        )
+        local_path.unlink()
+
+        download_root = self._download_root(config, dataset)
+        parent = local_path.parent
+        while parent != download_root and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def download(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        token: str | bool | None = None,
+        max_files: int | None = None,
+    ) -> DownloadSummary:
+        config.ensure_directories()
+        plan = self.plan_download(
+            config,
+            dataset,
+            language=language,
+            token=token,
+            max_files=max_files,
+            checkpoint_namespace="downloads",
+        )
+        checkpoint_store = self.checkpoint_store(config, namespace="downloads")
+        checkpoint = checkpoint_store.load(dataset.name, plan.repo_id, plan.revision, language)
+        completed = set(checkpoint.completed_files)
+        downloaded_paths: list[Path] = []
+        plan.download_root.mkdir(parents=True, exist_ok=True)
+
+        for remote in plan.pending_files:
+            local_path = self.download_remote_file(
+                config,
+                dataset,
+                remote.path,
+                language=language,
+                token=token,
+            )
+            downloaded_paths.append(local_path)
+            if remote.path not in completed:
+                checkpoint.completed_files.append(remote.path)
+                completed.add(remote.path)
+            checkpoint.last_downloaded_file = remote.path
+            checkpoint_store.save(checkpoint)
+
+        checkpoint_path = checkpoint_store.save(checkpoint)
+        return DownloadSummary(
+            dataset=dataset.name,
+            repo_id=plan.repo_id,
+            revision=plan.revision,
+            language=language,
+            download_root=plan.download_root,
+            checkpoint_path=checkpoint_path,
+            matched_count=plan.matched_count,
+            already_downloaded_count=plan.completed_count,
+            downloaded_count=len(downloaded_paths),
+            downloaded_files=downloaded_paths,
+        )
+
+    def _fetch_manifest(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None = None,
+    ) -> Path:
+        local_path = self.manifest_download_file(
+            repo_id=dataset.resolve_repo_id(),
+            filename=self._manifest_path(dataset),
+            repo_type=dataset.repo_type,
+            revision=dataset.revision,
+            cache_dir=config.storage.huggingface_cache_directory,
+            token=token,
+        )
+        return Path(local_path)
+
+    def _manifest_path(self, dataset: DatasetSpec) -> str:
+        manifest_path = dataset.extra.get("manifest_path", "urls/github.txt")
+        return str(manifest_path)
+
+    def _download_root(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+    ) -> Path:
+        return config.storage.download_directory / _slugify(dataset.name)
+
+    @staticmethod
+    def _relative_path_for_url(url: str) -> Path:
+        parsed = urlparse(url)
+        path = parsed.path.lstrip("/")
+        if not path:
+            raise ValueError(f"Cannot derive local path from URL: {url}")
+        return Path(path)

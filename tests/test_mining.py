@@ -12,10 +12,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from commentminer.config import DatasetSpec, PipelineConfig, StorageConfig
-from commentminer.downloader import HuggingFaceDownloader
+from commentminer.downloader import HuggingFaceDownloader, RedPajamaManifestDownloader
 from commentminer.extractors import ML4SEOpeningCommentExtractor
 from commentminer.pipeline import run_sharded_dataset
-from commentminer.sources import TheStackParquetSource
+from commentminer.sources import RedPajamaGithubSource, TheStackParquetSource
 
 
 @dataclass
@@ -82,6 +82,56 @@ def _copy_fixture_download(**kwargs: object) -> str:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture_path, target_path)
     return str(target_path)
+
+
+def _write_redpajama_fixture(path: Path) -> None:
+    rows = [
+        {
+            "text": "# first comment\n# second line\n\nprint('a')\n",
+            "meta": json.dumps(
+                {
+                    "language": "python",
+                    "repo_name": "repo-a",
+                    "path": "src/a.py",
+                    "license": "mit",
+                }
+            ),
+            "red_pajama_subset": "github",
+        },
+        {
+            "text": "print('b')\n",
+            "meta": json.dumps(
+                {
+                    "language": "python",
+                    "repo_name": "repo-b",
+                    "path": "src/b.py",
+                    "license": "apache-2.0",
+                }
+            ),
+            "red_pajama_subset": "github",
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
+def _manifest_download_factory(manifest_path: Path):
+    def _download(**_: object) -> str:
+        return str(manifest_path)
+
+    return _download
+
+
+def _fixture_url_download_factory(mapping: dict[str, Path]):
+    def _download(url: str, target_path: Path) -> Path:
+        fixture_path = mapping[url]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(fixture_path, target_path)
+        return target_path
+
+    return _download
 
 
 class FixtureRouterDownload:
@@ -153,6 +203,62 @@ class MiningTests(unittest.TestCase):
             self.assertNotIn("content", payload)
             self.assertEqual(payload["metadata"]["hexsha"], "a1")
             self.assertEqual(payload["metadata"]["ext"], "python")
+            self.assertEqual(payload["path"], "src/a.py")
+
+    def test_run_sharded_dataset_supports_redpajama_github_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fixture_path = root / "fixtures" / "github-000.jsonl"
+            manifest_path = root / "fixtures" / "github.txt"
+            remote_url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/github-000.jsonl"
+            _write_redpajama_fixture(fixture_path)
+            manifest_path.write_text(f"{remote_url}\n", encoding="utf-8")
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024 * 1024,
+                ),
+                datasets=[],
+                checkpoint_interval_records=1,
+            )
+            dataset = DatasetSpec(
+                name="redpajama-github",
+                source="redpajama_manifest",
+                repo_id="togethercomputer/RedPajama-Data-1T",
+                streaming=True,
+                extra={"manifest_path": "urls/github.txt"},
+            )
+            source = RedPajamaGithubSource(
+                config,
+                dataset,
+                show_progress=False,
+                downloader=RedPajamaManifestDownloader(
+                    manifest_download_file=_manifest_download_factory(manifest_path),
+                    remote_download_file=_fixture_url_download_factory({remote_url: fixture_path}),
+                ),
+            )
+
+            stats = run_sharded_dataset(
+                source,
+                ML4SEOpeningCommentExtractor,
+                config,
+                max_workers=1,
+            )
+
+            self.assertEqual(stats.records_seen, 2)
+            self.assertEqual(stats.comments_written, 1)
+            self.assertEqual(stats.failed_shards, 0)
+            shard_path = next(config.storage.output_directory.rglob("part-00000.jsonl"))
+            payload = json.loads(shard_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(payload["opening_comment"], "# first comment\n# second line")
+            self.assertNotIn("text", payload)
+            self.assertEqual(payload["metadata"]["license"], "mit")
             self.assertEqual(payload["path"], "src/a.py")
 
     def test_run_sharded_dataset_skips_failed_shard_and_reruns_missing_one(self) -> None:

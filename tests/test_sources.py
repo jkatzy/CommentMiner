@@ -11,8 +11,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from commentminer.config import DatasetSpec, PipelineConfig, StorageConfig
-from commentminer.downloader import HuggingFaceDownloader
-from commentminer.sources import ShardRowCursor, TheStackParquetSource
+from commentminer.downloader import HuggingFaceDownloader, RedPajamaManifestDownloader
+from commentminer.sources import RedPajamaGithubSource, ShardRowCursor, TheStackParquetSource
 
 
 @dataclass
@@ -67,6 +67,56 @@ def _copy_fixture_download(**kwargs: object) -> str:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture_path, target_path)
     return str(target_path)
+
+
+def _write_redpajama_fixture(path: Path) -> None:
+    rows = [
+        {
+            "text": "# first\nprint('a')\n",
+            "meta": json.dumps(
+                {
+                    "language": "python",
+                    "repo_name": "repo-a",
+                    "path": "src/a.py",
+                    "license": "mit",
+                }
+            ),
+            "red_pajama_subset": "github",
+        },
+        {
+            "text": "// second\npublic class B {}\n",
+            "meta": json.dumps(
+                {
+                    "language": "java",
+                    "repo_name": "repo-b",
+                    "path": "src/B.java",
+                    "license": "apache-2.0",
+                }
+            ),
+            "red_pajama_subset": "github",
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
+def _manifest_download_factory(manifest_path: Path):
+    def _download(**_: object) -> str:
+        return str(manifest_path)
+
+    return _download
+
+
+def _fixture_url_download_factory(mapping: dict[str, Path]):
+    def _download(url: str, target_path: Path) -> Path:
+        fixture_path = mapping[url]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(fixture_path, target_path)
+        return target_path
+
+    return _download
 
 
 class TheStackParquetSourceTests(unittest.TestCase):
@@ -172,6 +222,116 @@ class TheStackParquetSourceTests(unittest.TestCase):
             self.assertEqual([record.path for record in records], ["src/b.py", "src/c.py"])
             downloaded_path = root / "downloads" / "the-stack" / "data/python/train-00000-of-00001.parquet"
             self.assertFalse(downloaded_path.exists())
+
+
+class RedPajamaGithubSourceTests(unittest.TestCase):
+    def test_source_streams_jsonl_rows_and_deletes_processed_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fixture_path = root / "fixtures" / "github-000.jsonl"
+            manifest_path = root / "fixtures" / "github.txt"
+            remote_url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/github-000.jsonl"
+            _write_redpajama_fixture(fixture_path)
+            manifest_path.write_text(f"{remote_url}\n", encoding="utf-8")
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024,
+                ),
+                datasets=[],
+                checkpoint_interval_records=1,
+            )
+            dataset = DatasetSpec(
+                name="redpajama-github",
+                source="redpajama_manifest",
+                repo_id="togethercomputer/RedPajama-Data-1T",
+                streaming=True,
+                extra={"manifest_path": "urls/github.txt"},
+            )
+            source = RedPajamaGithubSource(
+                config,
+                dataset,
+                show_progress=False,
+                downloader=RedPajamaManifestDownloader(
+                    manifest_download_file=_manifest_download_factory(manifest_path),
+                    remote_download_file=_fixture_url_download_factory({remote_url: fixture_path}),
+                ),
+            )
+
+            records = list(source.iter_records())
+
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[0].language, "python")
+            self.assertEqual(records[0].path, "src/a.py")
+            self.assertEqual(records[0].metadata["license"], "mit")
+            self.assertEqual(records[0].metadata["red_pajama_subset"], "github")
+            self.assertEqual(records[1].language, "java")
+
+            downloaded_path = (
+                root
+                / "downloads"
+                / "redpajama-github"
+                / "redpajama-data-1T"
+                / "v1.0.0"
+                / "github"
+                / "github-000.jsonl"
+            )
+            self.assertFalse(downloaded_path.exists())
+
+            checkpoint_path = root / "checkpoints" / "processed-shards" / "redpajama-github.json"
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["completed_files"], [remote_url])
+
+    def test_source_filters_rows_by_selected_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fixture_path = root / "fixtures" / "github-000.jsonl"
+            manifest_path = root / "fixtures" / "github.txt"
+            remote_url = "https://data.together.xyz/redpajama-data-1T/v1.0.0/github/github-000.jsonl"
+            _write_redpajama_fixture(fixture_path)
+            manifest_path.write_text(f"{remote_url}\n", encoding="utf-8")
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                    max_records_per_shard=10,
+                    max_bytes_per_shard=1024,
+                ),
+                datasets=[],
+                checkpoint_interval_records=1,
+            )
+            dataset = DatasetSpec(
+                name="redpajama-github",
+                source="redpajama_manifest",
+                repo_id="togethercomputer/RedPajama-Data-1T",
+                streaming=True,
+                extra={"manifest_path": "urls/github.txt"},
+            )
+            source = RedPajamaGithubSource(
+                config,
+                dataset,
+                language="python",
+                show_progress=False,
+                downloader=RedPajamaManifestDownloader(
+                    manifest_download_file=_manifest_download_factory(manifest_path),
+                    remote_download_file=_fixture_url_download_factory({remote_url: fixture_path}),
+                ),
+            )
+
+            records = list(source.iter_records())
+
+            self.assertEqual([record.language for record in records], ["python"])
+            self.assertEqual(records[0].metadata["selected_language"], "python")
 
 
 if __name__ == "__main__":

@@ -17,8 +17,8 @@ from tqdm.auto import tqdm
 from .config import DatasetSpec, PipelineConfig
 from .downloader import RemoteFile
 from .extractors import ML4SEOpeningCommentExtractor
-from .models import CommentExtractor, CommentRecord, DatasetSource, InputRecord
-from .sources import TheStackParquetSource
+from .models import CommentExtractor, CommentRecord, DatasetSource, InputRecord, ShardedDatasetSource
+from .sources import RedPajamaGithubSource, TheStackParquetSource
 
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
@@ -303,8 +303,8 @@ def _merge_temp_output(writer: JsonlShardWriter, temp_output_path: Path | None) 
     temp_output_path.unlink()
 
 
-def _process_stack_shard(
-    source: TheStackParquetSource,
+def _process_shard(
+    source: ShardedDatasetSource,
     remote,
     extractor_factory: Callable[[], CommentExtractor],
     temp_root: Path,
@@ -361,7 +361,34 @@ def _process_stack_shard(
             temp_output_path.unlink()
 
 
-def _process_stack_shard_subprocess(
+def _build_sharded_source(
+    config: PipelineConfig,
+    dataset: DatasetSpec,
+    *,
+    language: str | None,
+    token: str | bool | None,
+    show_progress: bool,
+) -> ShardedDatasetSource:
+    if dataset.source == "huggingface_hub" and dataset.resolve_repo_id() == "bigcode/the-stack":
+        return TheStackParquetSource(
+            config,
+            dataset,
+            language=language,
+            show_progress=show_progress,
+            token=token,
+        )
+    if dataset.source == "redpajama_manifest":
+        return RedPajamaGithubSource(
+            config,
+            dataset,
+            language=language,
+            show_progress=show_progress,
+            token=token,
+        )
+    raise ValueError(f"Unsupported sharded dataset for subprocess workers: {dataset.name}")
+
+
+def _process_shard_subprocess(
     config_data: dict[str, object],
     dataset_data: dict[str, object],
     language: str | None,
@@ -374,7 +401,7 @@ def _process_stack_shard_subprocess(
 ) -> CompletedShardResult:
     config = PipelineConfig.from_dict(config_data, base_dir=Path.cwd())
     dataset = DatasetSpec.from_dict(dataset_data)
-    source = TheStackParquetSource(
+    source = _build_sharded_source(
         config,
         dataset,
         language=language,
@@ -385,7 +412,7 @@ def _process_stack_shard_subprocess(
         max_start_row=max_start_row,
         max_input_characters=max_input_characters,
     )
-    return _process_stack_shard(
+    return _process_shard(
         source,
         RemoteFile(path=remote_path, size_bytes=remote_size_bytes),
         lambda: extractor,
@@ -395,7 +422,7 @@ def _process_stack_shard_subprocess(
 
 
 def run_sharded_dataset(
-    source: TheStackParquetSource,
+    source: ShardedDatasetSource,
     extractor_factory: Callable[[], CommentExtractor],
     config: PipelineConfig,
     *,
@@ -522,7 +549,7 @@ def run_sharded_dataset(
         discovered_shards += 1
         if use_process_workers:
             future = executor.submit(
-                _process_stack_shard_subprocess,
+                _process_shard_subprocess,
                 config_data,
                 dataset_data,
                 source.language,
@@ -535,7 +562,7 @@ def run_sharded_dataset(
             )
         else:
             future = executor.submit(
-                _process_stack_shard,
+                _process_shard,
                 source,
                 remote,
                 _extractor_for_thread,

@@ -12,11 +12,12 @@ from typing import Sequence
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .config import PipelineConfig
-from .downloader import HuggingFaceDownloader
+from .downloader import HuggingFaceDownloader, RedPajamaManifestDownloader
 from .extractors import ML4SEOpeningCommentExtractor
 from .logging_utils import configure_logging
+from .models import ShardedDatasetSource
 from .pipeline import run_dataset, run_sharded_dataset
-from .sources import TheStackParquetSource
+from .sources import RedPajamaGithubSource, TheStackParquetSource
 
 _DEFAULT_WORKERS = max(1, min(2, os.cpu_count() or 1))
 _LOGGER = logging.getLogger(__name__)
@@ -101,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument(
         "--no-tqdm",
         action="store_true",
-        help="Disable per-shard tqdm progress bars during parquet streaming.",
+        help="Disable per-shard tqdm progress bars during streaming.",
     )
     mine.add_argument(
         "--workers",
@@ -181,6 +182,14 @@ def _list_languages(
     return 0
 
 
+def _build_downloader(dataset):
+    if dataset.source == "redpajama_manifest":
+        return RedPajamaManifestDownloader()
+    if dataset.source == "huggingface_hub":
+        return HuggingFaceDownloader()
+    raise ValueError(f"Dataset '{dataset.name}' source '{dataset.source}' is not supported yet")
+
+
 def _plan_download(
     config_path: Path,
     dataset_name: str,
@@ -192,7 +201,7 @@ def _plan_download(
 ) -> int:
     config = PipelineConfig.from_path(config_path)
     dataset = config.require_dataset(dataset_name)
-    downloader = HuggingFaceDownloader()
+    downloader = _build_downloader(dataset)
     token = _resolve_token(token_env)
     plan = downloader.plan_download(
         config,
@@ -235,7 +244,7 @@ def _download_dataset(
 ) -> int:
     config = PipelineConfig.from_path(config_path)
     dataset = config.require_dataset(dataset_name)
-    downloader = HuggingFaceDownloader()
+    downloader = _build_downloader(dataset)
     token = _resolve_token(token_env)
     summary = downloader.download(
         config,
@@ -273,6 +282,14 @@ def _build_source(
             show_progress=show_progress,
             token=token,
         )
+    if dataset.source == "redpajama_manifest":
+        return dataset, RedPajamaGithubSource(
+            config,
+            dataset,
+            language=language,
+            show_progress=show_progress,
+            token=token,
+        )
     raise ValueError(
         f"Dataset '{dataset.name}' is not supported by the mining command yet"
     )
@@ -300,7 +317,7 @@ def _mine_dataset(
         token_env=token_env,
     )
     logging_context = logging_redirect_tqdm() if show_progress else nullcontext()
-    if isinstance(source, TheStackParquetSource) and max_records is None:
+    if max_records is None and isinstance(source, ShardedDatasetSource):
         with logging_context:
             stats = run_sharded_dataset(
                 source,

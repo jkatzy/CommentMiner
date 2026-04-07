@@ -49,6 +49,21 @@
       "allow_patterns": [
         "replace-with-dataset-specific-root/**"
       ]
+    },
+    {
+      "name": "redpajama-github",
+      "source": "redpajama_manifest",
+      "repo_id": "togethercomputer/RedPajama-Data-1T",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": false,
+      "batch_size": 1000,
+      "extra": {
+        "manifest_path": "urls/github.txt",
+        "notes": "RedPajama GitHub uses a Hugging Face-hosted URL manifest. Mining can filter rows by language, but downloads remain shard-based."
+      }
     }
   ],
   "checkpoint_interval_records": 1000

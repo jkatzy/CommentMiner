@@ -9,12 +9,39 @@ from .models import InputRecord
 
 
 _LANGUAGE_ALIASES = {
-    "c-sharp": "csharp",
+    "bash": "shell",
+    "bat": "batchfile",
+    "cc": "c++",
+    "c-sharp": "c#",
+    "csharp": "c#",
+    "cpp": "c++",
+    "cs": "c#",
+    "cxx": "c++",
     "common-lisp": "lisp",
-    "f-sharp": "fsharp",
+    "f-sharp": "f#",
+    "fsharp": "f#",
+    "fs": "f#",
+    "hh": "c++",
+    "hpp": "c++",
+    "hxx": "c++",
+    "js": "javascript",
+    "jsx": "javascript",
+    "kt": "kotlin",
+    "kts": "kotlin",
     "objective-c": "objectivec",
-    "visual-basic-net": "vbnet",
-    "visual-basic-.net": "vbnet",
+    "ps1": "powershell",
+    "py": "python",
+    "rb": "ruby",
+    "rs": "rust",
+    "sh": "shell",
+    "ts": "typescript",
+    "tsx": "tsx",
+    "vb": "visual_basic_net",
+    "vbnet": "visual_basic_net",
+    "visual-basic-net": "visual_basic_net",
+    "visual-basic-.net": "visual_basic_net",
+    "yml": "yaml",
+    "zsh": "shell",
 }
 
 
@@ -52,6 +79,8 @@ def _normalize_language_token(value: str) -> list[str]:
             deduped.append(candidate)
             seen.add(candidate)
     return deduped
+
+
 @dataclass(slots=True)
 class ML4SEOpeningCommentExtractor:
     max_start_row: int = 3

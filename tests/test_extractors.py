@@ -48,6 +48,20 @@ class ExtractorTests(unittest.TestCase):
 
         self.assertEqual(match, "# short")
 
+    def test_ml4se_extractor_maps_common_file_extensions(self) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+        record = InputRecord(
+            dataset="redpajama-github",
+            record_id="r4",
+            content="// header\nclass Example {}\n",
+            metadata={"ext": "cs"},
+        )
+
+        match = extractor.extract_opening_comment(record)
+
+        self.assertEqual(match, "// header")
+        self.assertIn("c#", extractor._queries)
+
 
 if __name__ == "__main__":
     unittest.main()

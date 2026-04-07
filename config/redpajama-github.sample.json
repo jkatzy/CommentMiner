@@ -1,0 +1,29 @@
+{
+  "storage": {
+    "working_directory": "../var/work",
+    "output_directory": "../var/output",
+    "checkpoint_directory": "../var/checkpoints",
+    "download_directory": "../var/downloads",
+    "huggingface_cache_directory": "../var/hf-cache",
+    "max_records_per_shard": 100000,
+    "max_bytes_per_shard": 134217728
+  },
+  "datasets": [
+    {
+      "name": "redpajama-github",
+      "source": "redpajama_manifest",
+      "repo_id": "togethercomputer/RedPajama-Data-1T",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "extra": {
+        "manifest_path": "urls/github.txt",
+        "notes": "RedPajama GitHub shards are exposed through a Hugging Face-hosted URL manifest plus external JSONL shard URLs. --language filters rows during mining; it does not reduce which shard files are fetched."
+      }
+    }
+  ],
+  "checkpoint_interval_records": 1000
+}
