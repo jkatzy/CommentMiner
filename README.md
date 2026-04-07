@@ -62,12 +62,13 @@ uv add --dev <package>
 
 ## Pipeline Overview
 
-The current production pipeline has four stages:
+The current production pipeline has five stages:
 
 1. Download or stream dataset shards from Hugging Face.
 2. Extract opening comments and save only the comment plus row metadata.
 3. Aggregate extracted comment runs into one combined dataset.
-4. Run ScanCode over the aggregated comments to detect license notices.
+4. Deduplicate the aggregated comments by normalized hash.
+5. Run ScanCode over the deduplicated comments to detect license notices.
 
 The stages are intentionally separate:
 
@@ -82,6 +83,7 @@ Hugging Face dataset files
 -> local shard download / streaming checkpoint
 -> extracted comment JSONL shards
 -> aggregated comment JSONL shards
+-> deduplicated comment JSONL shards
 -> ScanCode-enriched JSONL shards
 ```
 
@@ -178,9 +180,43 @@ By default, the aggregated run is written under:
 var/output/combined-comments/<run_id>
 ```
 
-## Stage 4: License Scanning
+## Stage 4: Deduplication
 
-Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments. In the intended workflow, this stage runs on the aggregated dataset from Stage 3.
+Once comments are aggregated, deduplicate them before running ScanCode so downstream processing only scans one representative copy of each normalized comment.
+
+The deduplication stage:
+
+- removes whitespace and all other non-alphanumeric characters from each comment
+- hashes the normalized comment with SHA-256
+- sorts the hash stream with the external `sort` command
+- groups matching hashes into one deduplicated record
+- keeps per-occurrence metadata so you can map a deduplicated comment back to every source file
+- writes `occurrence_count` for each grouped comment
+
+Example:
+
+```bash
+uv run commentminer deduplicate-comment-run \
+  var/output/combined-comments/20260407T130000Z \
+  --dataset-name combined-comments-deduplicated
+```
+
+That produces a new run like:
+
+```text
+var/output/combined-comments-deduplicated/<dedup_run_id>
+```
+
+Each deduplicated record keeps:
+
+- one representative `opening_comment`
+- `normalized_comment_hash`
+- `occurrence_count`
+- `occurrences`, containing the metadata of every grouped comment instance
+
+## Stage 5: License Scanning
+
+Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments. In the intended workflow, this stage runs on the deduplicated dataset from Stage 4.
 
 This step is intentionally separate from comment extraction:
 
@@ -195,7 +231,7 @@ Example:
 
 ```bash
 uv run commentminer scan-comment-licenses \
-  var/output/combined-comments/20260407T130000Z \
+  var/output/combined-comments-deduplicated/20260407T140000Z \
   --scancode scancode \
   --batch-size 500 \
   --min-license-score 95 \
@@ -207,14 +243,15 @@ The enriched output is written by default to a sibling directory named `<input-r
 For example, scanning:
 
 ```text
-var/output/combined-comments/20260407T130000Z
+var/output/combined-comments-deduplicated/20260407T140000Z
 ```
 
 produces:
 
 ```text
-var/output/combined-comments/20260407T130000Z-license-scan
+var/output/combined-comments-deduplicated/20260407T140000Z-license-scan
 ```
+
 The default ScanCode settings now match the existing Stack v2 pipeline:
 
 - `scancode --quiet --license --json-pp`
@@ -235,7 +272,8 @@ uv sync
 uv run commentminer plan-download config/the-stack.sample.json the-stack --language ampl --max-files 1
 uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
 uv run commentminer aggregate-comment-runs var/output/the-stack/<run_id> --dataset-name combined-comments
-uv run commentminer scan-comment-licenses var/output/combined-comments/<combined_run_id> --scancode scancode
+uv run commentminer deduplicate-comment-run var/output/combined-comments/<combined_run_id> --dataset-name combined-comments-deduplicated
+uv run commentminer scan-comment-licenses var/output/combined-comments-deduplicated/<dedup_run_id> --scancode scancode
 ```
 
 That produces:
@@ -243,7 +281,8 @@ That produces:
 - raw download/checkpoint state under `var/downloads/` and `var/checkpoints/`
 - extracted comments under `var/output/the-stack/<run_id>/`
 - aggregated comments under `var/output/combined-comments/<combined_run_id>/`
-- ScanCode-enriched comments under `var/output/combined-comments/<combined_run_id>-license-scan/`
+- deduplicated comments under `var/output/combined-comments-deduplicated/<dedup_run_id>/`
+- ScanCode-enriched comments under `var/output/combined-comments-deduplicated/<dedup_run_id>-license-scan/`
 
 ## Baseline Workflow
 
@@ -251,8 +290,9 @@ That produces:
 2. Resolve or inspect the shard files that will be downloaded.
 3. Run comment extraction to emit JSONL shards plus checkpoints and run manifests.
 4. Aggregate one or more extracted comment runs into one dataset.
-5. Post-process the aggregated comment shards with ScanCode.
-6. Merge or analyze the resulting comment dataset.
+5. Deduplicate the aggregated run by normalized comment hash.
+6. Post-process the deduplicated comment shards with ScanCode.
+7. Merge or analyze the resulting comment dataset.
 
 ## Current Status
 
@@ -264,5 +304,6 @@ The repository currently includes:
 - `ml4setk.OpeningCommentQuery` integration for opening-comment extraction
 - JSONL output sharding that keeps row metadata but excludes source code content
 - aggregation of extracted comment runs into one combined dataset with source-dataset provenance
+- deduplication of aggregated comment runs using multithreaded hashing plus external sort-based grouping
 - post-processing license detection over extracted comments using ScanCode
 - runtime logging plus shard-level `tqdm` progress during streaming

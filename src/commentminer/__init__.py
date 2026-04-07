@@ -2,6 +2,7 @@
 
 from .aggregation import AggregateCommentRunStats, aggregate_comment_runs
 from .config import DatasetSpec, PipelineConfig, StorageConfig
+from .deduplication import DeduplicateCommentRunStats, deduplicate_comment_run
 from .downloader import DownloadPlan, DownloadSummary, HuggingFaceDownloader, RedPajamaManifestDownloader
 from .extractors import ML4SEOpeningCommentExtractor
 from .license_scanner import LicenseScanStats, scan_comment_licenses
@@ -13,6 +14,7 @@ __all__ = [
     "AggregateCommentRunStats",
     "CommentRecord",
     "DatasetSpec",
+    "DeduplicateCommentRunStats",
     "DownloadPlan",
     "DownloadSummary",
     "HuggingFaceDownloader",
@@ -28,6 +30,7 @@ __all__ = [
     "StorageConfig",
     "TheStackParquetSource",
     "aggregate_comment_runs",
+    "deduplicate_comment_run",
     "run_dataset",
     "run_sharded_dataset",
     "scan_comment_licenses",

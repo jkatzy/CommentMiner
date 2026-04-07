@@ -13,6 +13,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .aggregation import aggregate_comment_runs
 from .config import PipelineConfig
+from .deduplication import deduplicate_comment_run
 from .downloader import HuggingFaceDownloader, RedPajamaManifestDownloader
 from .extractors import ML4SEOpeningCommentExtractor
 from .license_scanner import scan_comment_licenses
@@ -134,6 +135,51 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Emit an aggregation progress log every N records.",
+    )
+
+    deduplicate = subparsers.add_parser(
+        "deduplicate-comment-run",
+        help="Deduplicate an aggregated comment run before downstream processing.",
+    )
+    deduplicate.add_argument("input_directory", type=Path)
+    deduplicate.add_argument("--output-root", type=Path)
+    deduplicate.add_argument(
+        "--dataset-name",
+        help="Dataset name to assign to the deduplicated output run. Defaults to <input-dataset>-deduplicated.",
+    )
+    deduplicate.add_argument(
+        "--source-field",
+        default="source_dataset",
+        help="Field name used to identify the original source dataset in each occurrence record.",
+    )
+    deduplicate.add_argument(
+        "--hash-workers",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="Number of worker threads to use while normalizing and hashing comments.",
+    )
+    deduplicate.add_argument(
+        "--hash-batch-size",
+        type=int,
+        default=1000,
+        help="Number of comments to hash per batch before writing to the temporary sort input.",
+    )
+    deduplicate.add_argument(
+        "--sort-parallelism",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="Parallelism hint passed to the external sort command.",
+    )
+    deduplicate.add_argument(
+        "--sort-command",
+        default="sort",
+        help="External sort executable used to group identical comment hashes.",
+    )
+    deduplicate.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="Emit a deduplication progress log every N records or groups.",
     )
 
     scan_licenses = subparsers.add_parser(
@@ -465,6 +511,40 @@ def _aggregate_comment_runs(
     return 0
 
 
+def _deduplicate_comment_run(
+    input_directory: Path,
+    *,
+    output_root: Path | None,
+    dataset_name: str | None,
+    source_field: str,
+    hash_workers: int,
+    hash_batch_size: int,
+    sort_parallelism: int,
+    sort_command: str,
+    progress_every: int,
+) -> int:
+    stats = deduplicate_comment_run(
+        input_directory,
+        output_root=output_root,
+        dataset_name=dataset_name,
+        source_field=source_field,
+        hash_workers=hash_workers,
+        hash_batch_size=hash_batch_size,
+        sort_parallelism=sort_parallelism,
+        sort_command=sort_command,
+        progress_every=progress_every,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Input dataset: {stats.input_dataset_name}")
+    print(f"Dataset: {stats.dataset_name}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Records seen: {stats.records_seen}")
+    print(f"Unique comments: {stats.unique_comments}")
+    print(f"Duplicate occurrences: {stats.duplicate_occurrences}")
+    print(f"Shards written: {stats.shards_written}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -517,6 +597,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root=args.output_root,
                 dataset_name=args.dataset_name,
                 source_field=args.source_field,
+                progress_every=args.progress_every,
+            )
+        if args.command == "deduplicate-comment-run":
+            return _deduplicate_comment_run(
+                args.input_directory,
+                output_root=args.output_root,
+                dataset_name=args.dataset_name,
+                source_field=args.source_field,
+                hash_workers=args.hash_workers,
+                hash_batch_size=args.hash_batch_size,
+                sort_parallelism=args.sort_parallelism,
+                sort_command=args.sort_command,
                 progress_every=args.progress_every,
             )
         if args.command == "scan-comment-licenses":
