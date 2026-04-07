@@ -150,6 +150,14 @@ def deduplicate_comment_run(
             source_field=source_field,
             progress_every=progress_every,
         )
+    except Exception:
+        writer.close()
+        if writer.dataset_directory.exists():
+            shutil.rmtree(writer.dataset_directory)
+        dataset_root = writer.dataset_directory.parent
+        if dataset_root.exists() and not any(dataset_root.iterdir()):
+            dataset_root.rmdir()
+        raise
     finally:
         writer.close()
         if temp_root.exists():
@@ -264,24 +272,13 @@ def _sort_hashed_comments(
     ]
     env = os.environ.copy()
     env.setdefault("LC_ALL", "C")
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "The external sort command was not found. Install GNU sort or pass --sort-command with the executable path."
-        ) from exc
-
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        stdout = completed.stdout.strip()
-        detail = stderr or stdout or "no output"
-        raise RuntimeError(f"sort failed with exit code {completed.returncode}: {detail}")
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
 
 
 def _write_deduplicated_output(

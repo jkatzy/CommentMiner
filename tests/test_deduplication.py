@@ -135,6 +135,39 @@ class DeduplicationTests(unittest.TestCase):
                     output_root=aggregated_run,
                 )
 
+    def test_deduplicate_comment_run_fails_hard_and_cleans_output_on_missing_sort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            aggregated_run = _write_aggregated_run(
+                root / "output",
+                "combined-comments",
+                "run-1",
+                [
+                    {
+                        "dataset": "combined-comments",
+                        "record_id": "stack-1",
+                        "opening_comment": "hello",
+                        "language": "python",
+                        "path": "a.py",
+                        "repo": "repo-a",
+                        "extracted_at": "2026-04-07T00:00:00+00:00",
+                        "metadata": {},
+                        "source_dataset": "the-stack",
+                    }
+                ],
+            )
+            dedup_output_root = root / "dedup-output"
+
+            with self.assertRaises(FileNotFoundError):
+                deduplicate_comment_run(
+                    aggregated_run,
+                    output_root=dedup_output_root,
+                    dataset_name="combined-comments-deduplicated",
+                    sort_command="definitely-not-a-real-sort-command",
+                )
+
+            self.assertFalse((dedup_output_root / "combined-comments-deduplicated").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
