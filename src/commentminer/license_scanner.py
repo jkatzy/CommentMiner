@@ -65,6 +65,13 @@ class LicenseScanStats:
     batches_run: int = 0
 
 
+@dataclass(slots=True)
+class _ScannedBatch:
+    headers: list[dict[str, Any]]
+    records_scanned: int
+    detections: int
+
+
 def scan_comment_licenses(
     input_directory: Path,
     *,
@@ -90,6 +97,8 @@ def scan_comment_licenses(
         raise ValueError(f"No input shard files found in: {input_directory}")
 
     output_directory = (output_directory or input_directory.parent / f"{input_directory.name}-license-scan").resolve()
+    if output_directory == input_directory:
+        raise ValueError("Output directory must differ from the input run directory")
     output_directory.mkdir(parents=True, exist_ok=True)
     temp_root = output_directory / ".tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -130,7 +139,7 @@ def scan_comment_licenses(
                         continue
                     batch.append(json.loads(line))
                     if len(batch) >= batch_size:
-                        headers = _scan_batch(
+                        batch_result = _scan_batch(
                             batch,
                             output_handle,
                             temp_root,
@@ -139,31 +148,20 @@ def scan_comment_licenses(
                             min_match_coverage=min_match_coverage,
                             runner=runner,
                         )
-                        if headers and not scancode_headers:
-                            scancode_headers = headers
-                        stats.batches_run += 1
-                        stats.records_scanned += len(batch)
-                        detections = sum(
-                            1
-                            for payload in batch
-                            if payload["comment_license_detection"]["contains_license_notice"]
+                        if batch_result.headers and not scancode_headers:
+                            scancode_headers = batch_result.headers
+                        records_in_shard += batch_result.records_scanned
+                        detections_in_shard += batch_result.detections
+                        next_progress_update = _apply_scanned_batch(
+                            stats,
+                            batch_result,
+                            shard_name=shard_name,
+                            progress_every=progress_every,
+                            next_progress_update=next_progress_update,
                         )
-                        stats.records_with_detected_license += detections
-                        detections_in_shard += detections
-                        stats.records_without_detected_license += len(batch) - detections
-                        records_in_shard += len(batch)
-                        while stats.records_scanned >= next_progress_update:
-                            _LOGGER.info(
-                                "License scan progress records_scanned=%s records_with_detected_license=%s shards_processed=%s current_shard=%s",
-                                stats.records_scanned,
-                                stats.records_with_detected_license,
-                                stats.shards_processed,
-                                shard_name,
-                            )
-                            next_progress_update += progress_every
                         batch = []
                 if batch:
-                    headers = _scan_batch(
+                    batch_result = _scan_batch(
                         batch,
                         output_handle,
                         temp_root,
@@ -172,28 +170,17 @@ def scan_comment_licenses(
                         min_match_coverage=min_match_coverage,
                         runner=runner,
                     )
-                    if headers and not scancode_headers:
-                        scancode_headers = headers
-                    stats.batches_run += 1
-                    stats.records_scanned += len(batch)
-                    detections = sum(
-                        1
-                        for payload in batch
-                        if payload["comment_license_detection"]["contains_license_notice"]
+                    if batch_result.headers and not scancode_headers:
+                        scancode_headers = batch_result.headers
+                    records_in_shard += batch_result.records_scanned
+                    detections_in_shard += batch_result.detections
+                    next_progress_update = _apply_scanned_batch(
+                        stats,
+                        batch_result,
+                        shard_name=shard_name,
+                        progress_every=progress_every,
+                        next_progress_update=next_progress_update,
                     )
-                    stats.records_with_detected_license += detections
-                    detections_in_shard += detections
-                    stats.records_without_detected_license += len(batch) - detections
-                    records_in_shard += len(batch)
-                    while stats.records_scanned >= next_progress_update:
-                        _LOGGER.info(
-                            "License scan progress records_scanned=%s records_with_detected_license=%s shards_processed=%s current_shard=%s",
-                            stats.records_scanned,
-                            stats.records_with_detected_license,
-                            stats.shards_processed,
-                            shard_name,
-                        )
-                        next_progress_update += progress_every
 
             completed_shards.add(shard_name)
             checkpoint.completed_shards = sorted(completed_shards)
@@ -239,7 +226,7 @@ def _scan_batch(
     min_license_score: float,
     min_match_coverage: float,
     runner: Callable[..., dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
+) -> _ScannedBatch:
     with TemporaryDirectory(dir=temp_root) as temp_dir:
         batch_root = Path(temp_dir)
         inputs_dir = batch_root / "inputs"
@@ -268,8 +255,43 @@ def _scan_batch(
             )
             output_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+        detections = sum(
+            1
+            for payload in batch
+            if payload["comment_license_detection"]["contains_license_notice"]
+        )
         headers = scan_result.get("headers", [])
-        return headers if isinstance(headers, list) else []
+        return _ScannedBatch(
+            headers=headers if isinstance(headers, list) else [],
+            records_scanned=len(batch),
+            detections=detections,
+        )
+
+
+def _apply_scanned_batch(
+    stats: LicenseScanStats,
+    batch_result: _ScannedBatch,
+    *,
+    shard_name: str,
+    progress_every: int,
+    next_progress_update: int,
+) -> int:
+    stats.batches_run += 1
+    stats.records_scanned += batch_result.records_scanned
+    stats.records_with_detected_license += batch_result.detections
+    stats.records_without_detected_license += batch_result.records_scanned - batch_result.detections
+
+    while stats.records_scanned >= next_progress_update:
+        _LOGGER.info(
+            "License scan progress records_scanned=%s records_with_detected_license=%s shards_processed=%s current_shard=%s",
+            stats.records_scanned,
+            stats.records_with_detected_license,
+            stats.shards_processed,
+            shard_name,
+        )
+        next_progress_update += progress_every
+
+    return next_progress_update
 
 
 def _run_scancode(
