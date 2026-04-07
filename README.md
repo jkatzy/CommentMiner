@@ -182,6 +182,7 @@ The deduplication stage:
 
 - removes whitespace and all other non-alphanumeric characters from each comment
 - hashes the normalized comment with SHA-256
+- parallelizes the normalization and hashing pass across worker processes
 - sorts the hash stream with the external `sort` command
 - groups matching hashes into one deduplicated record
 - keeps per-occurrence metadata so you can map a deduplicated comment back to every source file
@@ -194,6 +195,24 @@ uv run commentminer deduplicate-comment-run \
   var/output/combined-comments/20260407T130000Z \
   --dataset-name combined-comments-deduplicated
 ```
+
+For large runs, the main throughput controls are:
+
+```bash
+uv run commentminer deduplicate-comment-run \
+  var/output/combined-comments/20260407T130000Z \
+  --dataset-name combined-comments-deduplicated \
+  --hash-workers 16 \
+  --hash-batch-size 10000 \
+  --sort-parallelism 16
+```
+
+Notes:
+
+- `--hash-workers` controls the multi-process preprocessing stage before external sorting
+- `--hash-batch-size` controls how many records are sent to each worker task at a time
+- `--sort-parallelism` is passed through to GNU `sort`
+- if the external `sort` command is missing or fails, the run now fails immediately instead of leaving an empty output run behind
 
 That produces a new run like:
 
