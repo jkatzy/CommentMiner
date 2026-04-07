@@ -9,6 +9,7 @@ from typing import Sequence
 
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+from .aggregation import aggregate_comment_runs
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .extractors import ML4SEOpeningCommentExtractor
@@ -92,6 +93,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tqdm",
         action="store_true",
         help="Disable per-shard tqdm progress bars during parquet streaming.",
+    )
+
+    aggregate = subparsers.add_parser(
+        "aggregate-comment-runs",
+        help="Combine extracted comment runs into one aggregated dataset before downstream processing.",
+    )
+    aggregate.add_argument("input_directories", type=Path, nargs="+")
+    aggregate.add_argument("--output-root", type=Path)
+    aggregate.add_argument(
+        "--dataset-name",
+        default="combined-comments",
+        help="Dataset name to assign to the aggregated output run.",
+    )
+    aggregate.add_argument(
+        "--source-field",
+        default="source_dataset",
+        help="Field name used to store the original source dataset on each aggregated record.",
+    )
+    aggregate.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="Emit an aggregation progress log every N records.",
     )
 
     scan_licenses = subparsers.add_parser(
@@ -357,6 +381,30 @@ def _scan_comment_licenses(
     return 0
 
 
+def _aggregate_comment_runs(
+    input_directories: Sequence[Path],
+    *,
+    output_root: Path | None,
+    dataset_name: str,
+    source_field: str,
+    progress_every: int,
+) -> int:
+    stats = aggregate_comment_runs(
+        input_directories,
+        output_root=output_root,
+        dataset_name=dataset_name,
+        source_field=source_field,
+        progress_every=progress_every,
+    )
+    print(f"Dataset: {stats.dataset_name}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Source datasets: {', '.join(stats.source_datasets)}")
+    print(f"Input runs: {len(stats.input_directories)}")
+    print(f"Records aggregated: {stats.records_aggregated}")
+    print(f"Shards written: {stats.shards_written}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -399,6 +447,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token_env=args.token_env,
                 max_records=args.max_records,
                 max_comment_start_row=args.max_comment_start_row,
+                progress_every=args.progress_every,
+            )
+        if args.command == "aggregate-comment-runs":
+            return _aggregate_comment_runs(
+                args.input_directories,
+                output_root=args.output_root,
+                dataset_name=args.dataset_name,
+                source_field=args.source_field,
                 progress_every=args.progress_every,
             )
         if args.command == "scan-comment-licenses":

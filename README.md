@@ -62,11 +62,12 @@ uv add --dev <package>
 
 ## Pipeline Overview
 
-The current production pipeline has three stages:
+The current production pipeline has four stages:
 
 1. Download or stream dataset shards from Hugging Face.
 2. Extract opening comments and save only the comment plus row metadata.
-3. Run ScanCode over the extracted comments to detect license notices.
+3. Aggregate extracted comment runs into one combined dataset.
+4. Run ScanCode over the aggregated comments to detect license notices.
 
 The stages are intentionally separate:
 
@@ -80,6 +81,7 @@ Typical data flow:
 Hugging Face dataset files
 -> local shard download / streaming checkpoint
 -> extracted comment JSONL shards
+-> aggregated comment JSONL shards
 -> ScanCode-enriched JSONL shards
 ```
 
@@ -143,9 +145,36 @@ var/output/<dataset>/<run_id>/part-xxxxx.jsonl
 
 Each run directory also includes a `manifest.json` describing what was processed.
 
-## Stage 3: License Scanning
+## Stage 3: Aggregation
 
-Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments.
+Once you have extracted comment runs from one or more source datasets, combine them into one dataset before running ScanCode.
+
+The aggregation stage:
+
+- reads one or more extracted run directories containing `part-*.jsonl`
+- writes a new aggregated run in the same JSONL shard format
+- adds a `source_dataset` field to each record
+- rewrites the record-level `dataset` field to the aggregated dataset name
+- preserves the rest of each extracted record unchanged
+
+Example:
+
+```bash
+uv run commentminer aggregate-comment-runs \
+  var/output/the-stack/20260407T114500Z \
+  var/output/redpajama-github/20260407T120500Z \
+  --dataset-name combined-comments
+```
+
+By default, the aggregated run is written under:
+
+```text
+var/output/combined-comments/<run_id>
+```
+
+## Stage 4: License Scanning
+
+Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments. In the intended workflow, this stage runs on the aggregated dataset from Stage 3.
 
 This step is intentionally separate from comment extraction:
 
@@ -160,7 +189,7 @@ Example:
 
 ```bash
 uv run commentminer scan-comment-licenses \
-  var/output/the-stack/20260407T114500Z \
+  var/output/combined-comments/20260407T130000Z \
   --scancode scancode \
   --batch-size 500 \
   --min-license-score 95 \
@@ -172,13 +201,13 @@ The enriched output is written by default to a sibling directory named `<input-r
 For example, scanning:
 
 ```text
-var/output/the-stack/20260407T114500Z
+var/output/combined-comments/20260407T130000Z
 ```
 
 produces:
 
 ```text
-var/output/the-stack/20260407T114500Z-license-scan
+var/output/combined-comments/20260407T130000Z-license-scan
 ```
 
 The default ScanCode settings now match the existing Stack v2 pipeline:
@@ -200,22 +229,25 @@ One minimal end-to-end flow for a small The Stack slice looks like this:
 uv sync
 uv run commentminer plan-download config/the-stack.sample.json the-stack --language ampl --max-files 1
 uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
-uv run commentminer scan-comment-licenses var/output/the-stack/<run_id> --scancode scancode
+uv run commentminer aggregate-comment-runs var/output/the-stack/<run_id> --dataset-name combined-comments
+uv run commentminer scan-comment-licenses var/output/combined-comments/<combined_run_id> --scancode scancode
 ```
 
 That produces:
 
 - raw download/checkpoint state under `var/downloads/` and `var/checkpoints/`
 - extracted comments under `var/output/the-stack/<run_id>/`
-- ScanCode-enriched comments under `var/output/the-stack/<run_id>-license-scan/`
+- aggregated comments under `var/output/combined-comments/<combined_run_id>/`
+- ScanCode-enriched comments under `var/output/combined-comments/<combined_run_id>-license-scan/`
 
 ## Baseline Workflow
 
 1. Define dataset sources in a config file.
 2. Resolve or inspect the shard files that will be downloaded.
 3. Run comment extraction to emit JSONL shards plus checkpoints and run manifests.
-4. Post-process the extracted comment shards with ScanCode.
-5. Merge or analyze the resulting comment dataset.
+4. Aggregate one or more extracted comment runs into one dataset.
+5. Post-process the aggregated comment shards with ScanCode.
+6. Merge or analyze the resulting comment dataset.
 
 ## Current Status
 
@@ -226,5 +258,6 @@ The repository currently includes:
 - shard-at-a-time The Stack parquet processing with bounded local storage
 - `ml4setk.OpeningCommentQuery` integration for opening-comment extraction
 - JSONL output sharding that keeps row metadata but excludes source code content
+- aggregation of extracted comment runs into one combined dataset with source-dataset provenance
 - post-processing license detection over extracted comments using ScanCode
 - runtime logging plus shard-level `tqdm` progress during streaming

@@ -1,5 +1,6 @@
 """CommentMiner package."""
 
+from .aggregation import AggregateCommentRunStats, aggregate_comment_runs
 from .config import DatasetSpec, PipelineConfig, StorageConfig
 from .downloader import DownloadPlan, DownloadSummary, HuggingFaceDownloader
 from .extractors import ML4SEOpeningCommentExtractor
@@ -9,6 +10,7 @@ from .pipeline import PipelineRunStats, run_dataset
 from .sources import ShardRowCursor, TheStackParquetSource
 
 __all__ = [
+    "AggregateCommentRunStats",
     "CommentRecord",
     "DatasetSpec",
     "DownloadPlan",
@@ -22,6 +24,7 @@ __all__ = [
     "ShardRowCursor",
     "StorageConfig",
     "TheStackParquetSource",
+    "aggregate_comment_runs",
     "run_dataset",
     "scan_comment_licenses",
 ]

@@ -120,6 +120,9 @@ class JsonlShardWriter:
 
     def write(self, record: CommentRecord) -> None:
         line = json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+        self.write_json_line(line)
+
+    def write_json_line(self, line: str) -> None:
         encoded = line.encode("utf-8")
 
         if self._handle is None:
