@@ -12,6 +12,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .extractors import ML4SEOpeningCommentExtractor
+from .license_scanner import scan_comment_licenses
 from .logging_utils import configure_logging
 from .pipeline import run_dataset
 from .sources import TheStackParquetSource
@@ -91,6 +92,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tqdm",
         action="store_true",
         help="Disable per-shard tqdm progress bars during parquet streaming.",
+    )
+
+    scan_licenses = subparsers.add_parser(
+        "scan-comment-licenses",
+        help="Scan previously extracted comment shards for license notices using ScanCode.",
+    )
+    scan_licenses.add_argument("input_directory", type=Path)
+    scan_licenses.add_argument("--output-directory", type=Path)
+    scan_licenses.add_argument("--scancode", default="scancode")
+    scan_licenses.add_argument("--batch-size", type=int, default=500)
+    scan_licenses.add_argument(
+        "--min-license-score",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode score for a match to count as a license hit. Matches the Stack v2 pipeline default.",
+    )
+    scan_licenses.add_argument(
+        "--min-match-coverage",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode match coverage for a match to count as a license hit. Matches the Stack v2 pipeline default.",
+    )
+    scan_licenses.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="Emit a license scan progress log every N records.",
     )
 
     return parser
@@ -299,6 +327,36 @@ def _mine_dataset(
     return 0
 
 
+def _scan_comment_licenses(
+    input_directory: Path,
+    *,
+    output_directory: Path | None,
+    scancode: str,
+    batch_size: int,
+    min_license_score: float,
+    min_match_coverage: float,
+    progress_every: int,
+) -> int:
+    stats = scan_comment_licenses(
+        input_directory,
+        output_directory=output_directory,
+        scancode_command=scancode,
+        batch_size=batch_size,
+        min_license_score=min_license_score,
+        min_match_coverage=min_match_coverage,
+        progress_every=progress_every,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Records scanned: {stats.records_scanned}")
+    print(f"Records with detected license: {stats.records_with_detected_license}")
+    print(f"Records without detected license: {stats.records_without_detected_license}")
+    print(f"Shards processed: {stats.shards_processed}")
+    print(f"Shards skipped: {stats.shards_skipped}")
+    print(f"Batches run: {stats.batches_run}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -343,8 +401,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_comment_start_row=args.max_comment_start_row,
                 progress_every=args.progress_every,
             )
+        if args.command == "scan-comment-licenses":
+            return _scan_comment_licenses(
+                args.input_directory,
+                output_directory=args.output_directory,
+                scancode=args.scancode,
+                batch_size=args.batch_size,
+                min_license_score=args.min_license_score,
+                min_match_coverage=args.min_match_coverage,
+                progress_every=args.progress_every,
+            )
     except (KeyError, ValueError) as exc:
         parser.exit(status=2, message=f"{exc}\n")
+    except RuntimeError as exc:
+        parser.exit(status=1, message=f"{exc}\n")
 
     parser.error(f"Unknown command: {args.command}")
     return 2

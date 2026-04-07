@@ -129,6 +129,36 @@ uv run commentminer plan-download config/the-stack.sample.json the-stack --langu
 uv run commentminer download config/the-stack.sample.json the-stack --language befunge --max-files 1
 ```
 
+## License Scanning
+
+Previously extracted comment runs can be post-processed with ScanCode to classify license notices found inside the extracted comments.
+
+This step is intentionally separate from comment extraction:
+
+- it reads an existing mined run directory containing `part-*.jsonl`
+- it writes a new sibling run directory with the same shard names plus `comment_license_detection`
+- it keeps a local checkpoint so reruns skip completed shards
+- it does not modify the original extracted-comment run in place
+
+The ScanCode CLI must be installed separately and available on `PATH`, or passed explicitly with `--scancode`.
+
+Example:
+
+```bash
+uv run commentminer scan-comment-licenses \
+  var/output/redpajama-github/20260407T114500Z \
+  --scancode scancode \
+  --batch-size 500 \
+  --min-license-score 95 \
+  --min-match-coverage 95
+```
+
+The enriched output is written by default to a sibling directory named `<input-run>-license-scan`.
+
+The default ScanCode settings now match the existing Stack v2 pipeline:
+
+- `scancode --quiet --license --json-pp`
+- classify a comment as containing license text only when `score >= 95` and `match_coverage >= 95`
 For private repos, pass a token through an environment variable:
 
 ```bash
