@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -40,16 +40,10 @@ class DeduplicateCommentRunStats:
 
 
 @dataclass(slots=True)
-class _HashTask:
-    ordinal: int
-    payload: dict[str, Any]
-
-
-@dataclass(slots=True)
 class _HashResult:
     digest: str
     ordinal: int
-    payload_json: str
+    payload_line: str
 
 
 def deduplicate_comment_run(
@@ -210,30 +204,36 @@ def _write_unsorted_hashes(
     hash_batch_size: int,
     progress_every: int,
 ) -> None:
-    tasks: list[_HashTask] = []
-    ordinal = 0
+    with output_path.open("w", encoding="utf-8") as handle:
+        if hash_workers == 1:
+            for chunk in _iter_hash_chunks(input_shards, hash_batch_size):
+                _write_hash_results(
+                    _hash_comment_chunk(chunk),
+                    handle,
+                    stats=stats,
+                    progress_every=progress_every,
+                )
+            return
 
-    with output_path.open("w", encoding="utf-8") as handle, ThreadPoolExecutor(max_workers=hash_workers) as executor:
-        for payload in _iter_run_payloads(input_shards):
-            tasks.append(_HashTask(ordinal=ordinal, payload=payload))
-            ordinal += 1
-            if len(tasks) >= hash_batch_size:
-                _flush_hash_batch(tasks, handle, executor, stats=stats, progress_every=progress_every)
-                tasks = []
-        if tasks:
-            _flush_hash_batch(tasks, handle, executor, stats=stats, progress_every=progress_every)
+        with ProcessPoolExecutor(max_workers=hash_workers) as executor:
+            for results in executor.map(_hash_comment_chunk, _iter_hash_chunks(input_shards, hash_batch_size), chunksize=1):
+                _write_hash_results(
+                    results,
+                    handle,
+                    stats=stats,
+                    progress_every=progress_every,
+                )
 
 
-def _flush_hash_batch(
-    tasks: list[_HashTask],
+def _write_hash_results(
+    results: Sequence[_HashResult],
     handle,
-    executor: ThreadPoolExecutor,
     *,
     stats: DeduplicateCommentRunStats,
     progress_every: int,
 ) -> None:
-    for result in executor.map(_hash_comment_payload, tasks):
-        handle.write(f"{result.digest}\t{result.ordinal:020d}\t{result.payload_json}\n")
+    for result in results:
+        handle.write(f"{result.digest}\t{result.ordinal:020d}\t{result.payload_line}\n")
         stats.records_seen += 1
         if stats.records_seen % progress_every == 0:
             _LOGGER.info(
@@ -243,11 +243,34 @@ def _flush_hash_batch(
             )
 
 
-def _hash_comment_payload(task: _HashTask) -> _HashResult:
-    payload_json = json.dumps(task.payload, ensure_ascii=False)
-    normalized_comment = "".join(character for character in str(task.payload.get("opening_comment", "")) if character.isalnum())
-    digest = hashlib.sha256(normalized_comment.encode("utf-8")).hexdigest()
-    return _HashResult(digest=digest, ordinal=task.ordinal, payload_json=payload_json)
+def _iter_hash_chunks(
+    input_shards: Sequence[Path],
+    hash_batch_size: int,
+) -> Iterable[list[tuple[int, str]]]:
+    chunk: list[tuple[int, str]] = []
+    ordinal = 0
+    for line in _iter_run_lines(input_shards):
+        chunk.append((ordinal, line))
+        ordinal += 1
+        if len(chunk) >= hash_batch_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _hash_comment_chunk(chunk: Sequence[tuple[int, str]]) -> list[_HashResult]:
+    results: list[_HashResult] = []
+    for ordinal, payload_line in chunk:
+        payload = json.loads(payload_line)
+        if "opening_comment" not in payload:
+            raise ValueError("Input record does not look like an extracted or aggregated comment run")
+        normalized_comment = "".join(
+            character for character in str(payload.get("opening_comment", "")) if character.isalnum()
+        )
+        digest = hashlib.sha256(normalized_comment.encode("utf-8")).hexdigest()
+        results.append(_HashResult(digest=digest, ordinal=ordinal, payload_line=payload_line))
+    return results
 
 
 def _sort_hashed_comments(
@@ -373,15 +396,20 @@ def _build_occurrence_metadata(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _iter_run_payloads(shards: Iterable[Path]) -> Iterable[dict[str, Any]]:
+    for line in _iter_run_lines(shards):
+        payload = json.loads(line)
+        if "opening_comment" not in payload:
+            raise ValueError("Input record does not look like an extracted or aggregated comment run")
+        yield payload
+
+
+def _iter_run_lines(shards: Iterable[Path]) -> Iterable[str]:
     for shard in shards:
         with shard.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
-                payload = json.loads(line)
-                if "opening_comment" not in payload:
-                    raise ValueError(f"Shard {shard} does not look like an extracted or aggregated comment run")
-                yield payload
+                yield line.rstrip("\n")
 
 
 def _write_dedup_manifest(
