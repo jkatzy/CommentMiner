@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
@@ -41,6 +42,7 @@ def _write_fixture(path: Path) -> None:
                 "max_stars_repo_name": "repo-a",
                 "max_stars_repo_path": "src/a.py",
                 "hexsha": "a1",
+                "created_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
             },
             {
                 "content": "print('b')\n",
@@ -116,6 +118,7 @@ class MiningTests(unittest.TestCase):
             self.assertNotIn("content", payload)
             self.assertEqual(payload["metadata"]["hexsha"], "a1")
             self.assertEqual(payload["metadata"]["ext"], "python")
+            self.assertEqual(payload["metadata"]["created_at"], "2026-01-02T03:04:05+00:00")
             self.assertEqual(payload["path"], "src/a.py")
 
 

@@ -28,6 +28,15 @@
       ],
       "extra": {
         "notes": "General The Stack sample config. Languages are discovered from the Hugging Face repo layout at runtime.",
+        "content_columns": ["content", "text"],
+        "language_columns": ["lang", "language", "ext"],
+        "path_columns": ["max_stars_repo_path", "max_issues_repo_path", "max_forks_repo_path", "path"],
+        "repo_columns": ["max_stars_repo_name", "max_issues_repo_name", "max_forks_repo_name", "repo_name"],
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
         "small_language_examples": {
           "ampl": "70980 bytes",
           "befunge": "24791 bytes",

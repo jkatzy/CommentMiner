@@ -27,3 +27,4 @@ coverage/
 # Generated artifacts
 data/
 var/
+*.log

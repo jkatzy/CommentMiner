@@ -12,7 +12,7 @@
 1. Source adapter
    Reads one upstream dataset and yields normalized input records.
 2. Extraction step
-   Passes each normalized record to the `ml4se-tk` opening-comment extractor.
+   Passes normalized records through a bounded worker pool backed by the `ml4se-tk` opening-comment extractor.
 3. Normalization step
    Converts extracted comments into a canonical output row.
 4. Shard writer
@@ -61,5 +61,11 @@ The first downloader implementation targets Hugging Face dataset repos:
 - enumerate repo files through the Hub API
 - filter files with dataset-specific glob patterns
 - support optional language-aware pattern selection
-- download one file at a time with a persistent checkpoint
+- download a bounded prefetch window of files with a persistent checkpoint
 - resume cleanly after interruption by skipping already completed files
+
+## Runtime Concurrency
+
+- Parquet sources keep a bounded window of remote shards downloaded or in flight.
+- The mining pipeline keeps a bounded queue of records submitted to comment extraction workers.
+- Checkpoints and output writes are still applied in source order, so resumability does not depend on worker completion order.

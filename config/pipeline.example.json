@@ -10,45 +10,162 @@
   },
   "datasets": [
     {
-      "name": "the-stack-v2",
+      "name": "the-stack",
       "source": "huggingface_hub",
-      "repo_id": "replace-with-hf-dataset-repo-id",
+      "repo_id": "bigcode/the-stack",
       "repo_type": "dataset",
       "revision": "main",
-      "input_uri": "replace-with-hf-dataset-repo-id",
       "split": "train",
       "streaming": true,
       "enabled": true,
-      "batch_size": 1000,
-      "languages": [
-        "python",
-        "java"
-      ],
+      "batch_size": 8192,
       "allow_patterns": [
-        "replace-with-dataset-specific-root/{language}/**"
+        "data/{language}/**"
       ],
       "ignore_patterns": [
         "**/.gitattributes",
         "**/README.md"
       ],
       "extra": {
-        "notes": "Replace repo_id and patterns with the real Hugging Face dataset layout."
+        "content_columns": ["content", "text"],
+        "language_columns": ["lang", "language", "ext"],
+        "path_columns": ["max_stars_repo_path", "max_issues_repo_path", "max_forks_repo_path", "path"],
+        "repo_columns": ["max_stars_repo_name", "max_issues_repo_name", "max_forks_repo_name", "repo_name"],
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false
       }
     },
     {
-      "name": "the-stack",
+      "name": "the-stack-v2",
       "source": "huggingface_hub",
-      "repo_id": "replace-with-hf-dataset-repo-id",
+      "repo_id": "bigcode/the-stack-v2",
       "repo_type": "dataset",
       "revision": "main",
-      "input_uri": "replace-with-hf-dataset-repo-id",
       "split": "train",
       "streaming": true,
-      "enabled": false,
+      "enabled": true,
       "batch_size": 1000,
       "allow_patterns": [
-        "replace-with-dataset-specific-root/**"
-      ]
+        "data/{language}/**"
+      ],
+      "ignore_patterns": [
+        "**/.gitattributes",
+        "**/README.md"
+      ],
+      "extra": {
+        "content_backend": "softwareheritage_s3",
+        "blob_id_column": "blob_id",
+        "src_encoding_column": "src_encoding",
+        "swh_content_url_template": "s3://softwareheritage/content/{blob_id}",
+        "swh_content_compression": ".gz",
+        "swh_s3_max_pool_connections": 1024,
+        "swh_s3_read_retries": 6,
+        "swh_s3_retry_backoff_seconds": 0.25,
+        "content_download_workers": 32,
+        "content_prefetch_records": 128,
+        "swh_skip_missing_content": true,
+        "aws_unsigned": true,
+        "content_columns": ["content", "text"],
+        "language_columns": ["language", "gha_language", "extension"],
+        "path_columns": ["path"],
+        "repo_columns": ["repo_name"],
+        "metadata_columns": ["blob_id", "src_encoding", "language", "gha_language", "extension", "path", "repo_name"],
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "The Stack v2 Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from s3://softwareheritage/content/{blob_id} with unsigned S3 reads by default; accept the HF terms and pass HF_TOKEN when needed."
+      }
+    },
+    {
+      "name": "starcoderdata",
+      "source": "huggingface_hub",
+      "repo_id": "bigcode/starcoderdata",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "{language}/**"
+      ],
+      "ignore_patterns": [
+        ".gitattributes",
+        "README.md",
+        "git-commits-cleaned/**",
+        "github-issues-filtered-structured/**",
+        "jupyter-scripts-dedup-filtered/**",
+        "jupyter-structured-clean-dedup/**"
+      ],
+      "extra": {
+        "content_columns": ["content", "text"],
+        "language_columns": ["lang", "language", "ext"],
+        "path_columns": ["max_stars_repo_path", "max_issues_repo_path", "max_forks_repo_path", "path"],
+        "repo_columns": ["max_stars_repo_name", "max_issues_repo_name", "max_forks_repo_name", "repo_name"],
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false
+      }
+    },
+    {
+      "name": "the-heap",
+      "source": "huggingface_hub",
+      "repo_id": "AISE-TUDelft/the-heap",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "data/{language}/**"
+      ],
+      "ignore_patterns": [
+        "**/.gitattributes",
+        "**/README.md"
+      ],
+      "extra": {
+        "content_columns": ["content"],
+        "language_columns": ["language", "extension"],
+        "path_columns": ["file_path", "file_name"],
+        "repo_columns": ["repo_name"],
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "Public parquet dataset. Language names use dataset casing such as ANTLR, Python, C++, and C#."
+      }
+    },
+    {
+      "name": "redpajama-github",
+      "source": "url_list_jsonl",
+      "repo_id": "togethercomputer/RedPajama-Data-1T",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "extra": {
+        "url_list_path": "urls/github.txt",
+        "content_columns": ["text"],
+        "language_columns": [],
+        "language_hint_columns": ["meta.language"],
+        "infer_language_from_path": true,
+        "path_columns": ["meta.path"],
+        "repo_columns": ["meta.repo_name"],
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "notes": "Streams RedPajama GitHub JSONL URLs directly; source JSONL files are not saved locally. meta.language is repo-level, so file language is inferred from meta.path."
+      }
     }
   ],
   "checkpoint_interval_records": 1000

@@ -1,12 +1,12 @@
 # CommentMiner
 
-CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack and related corpora. The repository focuses on orchestration: downloading remote dataset shards, passing source records through an external comment extractor, normalizing the results into one schema, and then post-processing the extracted comments with license detection.
-
-The actual comment extraction logic is intentionally out of scope here. That will be provided by `ml4se-tk`, and this repository will integrate that extractor rather than reimplementing it.
+CommentMiner is a storage-aware pipeline for mining opening comments from large code datasets such as The Stack, The Stack v2, The Heap, StarCoderData, and RedPajama GitHub. The repository focuses on orchestration: reading remote dataset files, passing source records through `ml4setk.OpeningCommentQuery`, normalizing the results into one schema, writing resumable output shards, and post-processing extracted comments.
 
 ## Scope
 
 - Stream or batch over very large code datasets without assuming the full corpus fits on disk.
+- Download only bounded source subsets per language and keep only extracted comments.
+- Prefetch source shards and extract comments concurrently with bounded worker pools.
 - Normalize records from multiple upstream datasets into one output format.
 - Checkpoint progress so interrupted runs can resume.
 - Write mined comments to shard files that can later be merged into a unified dataset.
@@ -87,6 +87,16 @@ Hugging Face dataset files
 -> ScanCode-enriched JSONL shards
 ```
 
+## Supported Sources
+
+The example config includes these source types:
+
+- `huggingface_hub` parquet shards: The Stack v1, The Heap, and StarCoderData.
+- `huggingface_hub` plus `extra.content_backend: "softwareheritage_s3"`: The Stack v2 metadata shards, where source text is fetched on demand from Software Heritage S3 by `blob_id`.
+- `url_list_jsonl`: RedPajama GitHub, where a Hugging Face URL list points to large public JSONL files that are streamed directly.
+
+The Pile GitHub component is currently not enabled because the public dataset script points to a tar archive rather than parquet or JSONL files. It needs a separate archive adapter before it can be mined with the same storage guarantees.
+
 ## Stage 1: Download
 
 The downloader is designed for large dataset repos on the Hugging Face Hub:
@@ -96,11 +106,13 @@ The downloader is designed for large dataset repos on the Hugging Face Hub:
 - Hugging Face cache metadata is kept under `var/hf-cache/`
 - language-specific downloads are supported when the dataset config declares language-aware patterns
 - for parquet-backed sources like The Stack, `streaming: true` now means shard-at-a-time processing with local shard cleanup after processing
+- mining uses direct scratch downloads by default, so source shards are not retained in the Hugging Face cache unless `--cache-source-files` is passed
 
 There are now two distinct modes:
 
 - `commentminer download ...`: explicitly save selected Hub files locally
 - `TheStackParquetSource`: download one parquet shard, iterate its rows, checkpoint progress, and delete the shard when processing finishes
+- `StackV2SWHContentSource`: download one Stack v2 metadata parquet shard, fetch each row's gzipped source blob from Software Heritage S3, and keep only extracted comments
 
 Useful commands:
 
@@ -122,7 +134,42 @@ The mining stage is the main production step. For The Stack, it downloads one sh
 Mine a configured The Stack language slice and write only extracted comments plus row metadata to JSONL shards:
 
 ```bash
-uv run commentminer mine-dataset config/the-stack.sample.json the-stack --language ampl --max-records 25
+uv run commentminer mine-dataset config/the-stack.sample.json the-stack \
+  --language ampl \
+  --max-files 1 \
+  --max-records 25 \
+  --prefetch-files 4 \
+  --download-workers 4 \
+  --extraction-workers 4
+```
+
+The Stack, The Stack v2, and StarCoderData are gated on Hugging Face. Accept the dataset terms and pass a token when needed:
+
+```bash
+uv run commentminer mine-dataset config/pipeline.example.json the-stack-v2 \
+  --language AMPL \
+  --max-files 1 \
+  --max-records 100 \
+  --token-env HF_TOKEN
+```
+
+For The Stack v2, the Hugging Face parquet files contain Software Heritage IDs rather than source text. The Stack v2 adapter fetches complete source bytes from `s3://softwareheritage/content/{blob_id}` using unsigned S3 reads by default, decodes them with `src_encoding`, and does not persist source text. It uses a thread-backed S3 fetch queue, defaults to the fastest measured setting here of 32 S3 content download threads, can be raised explicitly to 1024 threads, retries transient DNS/socket/S3 failures, skips S3 reads for languages unsupported by the configured extractor, and records missing SWH objects as empty-content skips by default. `extra.content_prefetch_records` bounds queued or completed-but-not-yet-yielded rows, and should stay at least as large as `extra.content_download_workers`. Set `extra.aws_unsigned` to `false` if you need to use explicit AWS credentials instead.
+
+Benchmark the Stack v2 processor path against a local metadata parquet shard while including Software Heritage source blob downloads:
+
+```bash
+uv run python scripts/benchmark-stack-v2-throughput.py
+```
+
+Use `--content-mode stub` only when you need to isolate local parquet and extraction overhead without measuring Software Heritage object-store throughput.
+
+The Heap is public and uses dataset-cased language names:
+
+```bash
+uv run commentminer mine-dataset config/pipeline.example.json the-heap \
+  --language ANTLR \
+  --max-files 1 \
+  --max-records 100
 ```
 
 For large runs, keep the default `INFO` logs or raise verbosity:
@@ -133,19 +180,73 @@ uv run commentminer --log-level INFO mine-dataset config/the-stack.sample.json t
 
 `mine-dataset` now shows a per-parquet-shard `tqdm` progress bar during streaming so you can track shard-level completion and ETA. Disable that with `--no-tqdm` if you want log-only output.
 
+Mining overlaps three bounded stages for parquet-backed sources: shard downloads, parquet row streaming, and comment extraction. Use `--download-workers` with `--prefetch-files` to control concurrent shard downloads, and `--extraction-workers` with `--extraction-buffer` to control the comment extraction thread pool and queue size.
+
 The saved output excludes the source `content` field. It keeps:
 
 - `opening_comment`
 - canonical fields such as `dataset`, `record_id`, `language`, `path`, and `repo`
 - all non-content row metadata in the `metadata` object
 
-The mined dataset is written under:
+During mining, shards are written as resumable run outputs:
 
 ```text
-var/output/<dataset>/<run_id>/part-xxxxx.jsonl
+var/output/<dataset-language>/<run-id>/part-*.jsonl
+var/output/<dataset-language>/<run-id>/manifest.json
 ```
 
-Each run directory also includes a `manifest.json` describing what was processed.
+For Hugging Face upload, materialize one Parquet dataset tree grouped by source dataset and language:
+
+```bash
+uv run commentminer export-hf-dataset config/pipeline.example.json var/comment-dataset \
+  --dedupe-record-ids \
+  --overwrite
+```
+
+That produces:
+
+```text
+var/comment-dataset/
+  README.md
+  manifest.json
+  the-stack-v2/
+    Python/
+      part-00000.parquet
+  the-heap/
+    ANTLR/
+      part-00000.parquet
+```
+
+Upload `var/comment-dataset` as the single Hugging Face dataset repository. The generated dataset card declares one config per `<dataset>__<language>` and points each config at the matching nested Parquet shards. Exported Parquet files use a stable schema and store `metadata` as a JSON string.
+
+Mine a bounded matrix across every enabled dataset/language slice:
+
+```bash
+uv run commentminer mine-config config/pipeline.example.json \
+  --max-files-per-language 1 \
+  --max-records-per-language 500 \
+  --prefetch-files 4 \
+  --download-workers 4 \
+  --extraction-workers 4 \
+  --token-env HF_TOKEN \
+  --skip-errors
+```
+
+For RedPajama GitHub, the source JSONL files are streamed from their public URLs and are not saved locally. RedPajama `meta.language` is repo-level metadata, so the example config infers file language from `meta.path`:
+
+```bash
+uv run commentminer mine-dataset config/pipeline.example.json redpajama-github \
+  --language java \
+  --max-files 1 \
+  --max-records 100 \
+  --max-comment-start-row 20
+```
+
+Inspect configured language choices:
+
+```bash
+uv run commentminer list-languages config/pipeline.example.json the-stack-v2
+```
 
 ## Stage 3: Aggregation
 
@@ -311,12 +412,16 @@ That produces:
 
 The repository currently includes:
 
-- a `uv`-managed Python package scaffold
+- a Python package and CLI
 - checkpointed Hugging Face downloads with language-aware file selection
-- shard-at-a-time The Stack parquet processing with bounded local storage
+- concrete storage-aware adapters for Hugging Face parquet shards and URL-list JSONL streams
+- shard-at-a-time parquet processing with bounded local storage
 - `ml4setk.OpeningCommentQuery` integration for opening-comment extraction
 - JSONL output sharding that keeps row metadata but excludes source code content
+- concrete configs for The Stack v1, The Stack v2, The Heap, StarCoderData, and RedPajama GitHub
 - aggregation of extracted comment runs into one combined dataset with source-dataset provenance
 - deduplication of aggregated comment runs using multithreaded hashing plus external sort-based grouping
 - post-processing license detection over extracted comments using ScanCode
 - runtime logging plus shard-level `tqdm` progress during streaming
+
+The main remaining adapter gap is archive-based sources such as The Pile GitHub component.

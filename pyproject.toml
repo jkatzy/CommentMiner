@@ -10,8 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "huggingface-hub>=1,<2",
+    "httpx>=0.28,<1",
     "ml4setk",
     "pyarrow>=18,<20",
+    "smart-open[s3]>=7,<8",
     "tqdm>=4.66,<5",
 ]
 
@@ -28,4 +30,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.uv.sources]
-ml4setk = { url = "https://github.com/jkatzy/ML4SE-toolkit/archive/300794f8fc9016133089db2b3579e1fce5592faf.tar.gz" }
+ml4setk = { url = "https://github.com/jkatzy/ML4SE-toolkit/archive/7a2adcb665db5a6051fa7d758754f68540609135.tar.gz" }

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+import fcntl
 import fnmatch
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Iterator
 
-from huggingface_hub import HfApi, hf_hub_download
+import httpx
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
+from huggingface_hub.utils import build_hf_headers
 
 from .config import DatasetSpec, PipelineConfig
 
@@ -17,6 +23,9 @@ from .config import DatasetSpec, PipelineConfig
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
 _LOGGER = logging.getLogger(__name__)
 _LANGUAGE_PLACEHOLDER = "__COMMENTMINER_LANGUAGE__"
+_DEFAULT_DIRECT_DOWNLOAD_RETRIES = 5
+_DEFAULT_DIRECT_DOWNLOAD_RETRY_BACKOFF_SECONDS = 10.0
+_REMOTE_FILE_CACHE_NAMESPACE = "remote-file-cache"
 
 
 def _slugify(value: str) -> str:
@@ -43,6 +52,46 @@ def _compile_language_pattern(pattern: str) -> re.Pattern[str]:
     return re.compile(
         translated.replace(_LANGUAGE_PLACEHOLDER, r"(?P<language>[^/]+)")
     )
+
+
+def _nonnegative_int_option(*values: Any, default: int) -> int:
+    for value in values:
+        if value is None:
+            continue
+        result = int(value)
+        if result < 0:
+            raise ValueError(f"Expected non-negative integer, got {result}")
+        return result
+    return default
+
+
+def _nonnegative_float_option(*values: Any, default: float) -> float:
+    for value in values:
+        if value is None:
+            continue
+        result = float(value)
+        if result < 0:
+            raise ValueError(f"Expected non-negative float, got {result}")
+        return result
+    return default
+
+
+def _positive_int_option(*values: Any, default: int) -> int:
+    for value in values:
+        if value is None:
+            continue
+        result = int(value)
+        if result < 1:
+            raise ValueError(f"Expected positive integer, got {result}")
+        return result
+    return default
+
+
+def _is_retryable_http_error(exc: httpx.HTTPError) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code == 408 or status_code == 429 or status_code >= 500
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +235,7 @@ class HuggingFaceDownloader:
     ) -> None:
         self.api = api or HfApi()
         self.download_file = download_file or hf_hub_download
+        self._uses_default_download_file = download_file is None
 
     def plan_download(
         self,
@@ -208,7 +258,12 @@ class HuggingFaceDownloader:
             language or "all",
             checkpoint_namespace,
         )
-        remote_files = self.list_remote_files(dataset, language=language, token=token)
+        remote_files = self.list_remote_files(
+            dataset,
+            language=language,
+            token=token,
+            cache_directory=self.remote_file_cache_directory(config),
+        )
         completed = set(checkpoint.completed_files)
         remote_paths = {remote.path for remote in remote_files}
         pending_files = [remote for remote in remote_files if remote.path not in completed]
@@ -236,6 +291,7 @@ class HuggingFaceDownloader:
         *,
         language: str | None = None,
         token: str | bool | None = None,
+        cache_directory: Path | None = None,
     ) -> list[RemoteFile]:
         if dataset.source != "huggingface_hub":
             raise ValueError(f"Dataset '{dataset.name}' is not configured for Hugging Face downloads")
@@ -248,25 +304,19 @@ class HuggingFaceDownloader:
             repo_id,
             language or "all",
         )
-        tree = self.api.list_repo_tree(
-            repo_id=repo_id,
-            repo_type=dataset.repo_type,
-            revision=dataset.revision,
-            recursive=True,
+        all_remote_files = self._load_or_list_remote_files(
+            dataset,
             token=token,
+            cache_directory=cache_directory,
         )
-
-        remote_files: list[RemoteFile] = []
-        for entry in tree:
-            path = getattr(entry, "path", None)
-            size_bytes = getattr(entry, "size", None)
-            if path is None or size_bytes is None:
-                continue
+        remote_files = []
+        for remote in all_remote_files:
+            path = remote.path
             if not _matches_any(path, allow_patterns):
                 continue
             if not _matches_none(path, ignore_patterns):
                 continue
-            remote_files.append(RemoteFile(path=path, size_bytes=size_bytes))
+            remote_files.append(remote)
 
         remote_files.sort(key=lambda item: item.path)
         _LOGGER.info(
@@ -282,6 +332,7 @@ class HuggingFaceDownloader:
         dataset: DatasetSpec,
         *,
         token: str | bool | None = None,
+        cache_directory: Path | None = None,
     ) -> list[str]:
         configured_languages = dataset.available_languages()
         if configured_languages:
@@ -298,7 +349,11 @@ class HuggingFaceDownloader:
             dataset.name,
             dataset.resolve_repo_id(),
         )
-        remote_files = self.list_remote_files(dataset, token=token)
+        remote_files = self.list_remote_files(
+            dataset,
+            token=token,
+            cache_directory=cache_directory,
+        )
         compiled_patterns = [_compile_language_pattern(pattern) for pattern in discovery_patterns]
         languages: set[str] = set()
         for remote in remote_files:
@@ -315,6 +370,147 @@ class HuggingFaceDownloader:
             dataset.name,
         )
         return discovered
+
+    def remote_file_cache_directory(self, config: PipelineConfig) -> Path:
+        return config.storage.working_directory / _REMOTE_FILE_CACHE_NAMESPACE
+
+    def _load_or_list_remote_files(
+        self,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None,
+        cache_directory: Path | None,
+    ) -> list[RemoteFile]:
+        if cache_directory is None:
+            return self._list_repo_tree_files(dataset, token=token)
+
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        cache_path = self._remote_file_cache_path(cache_directory, dataset)
+        cached = self._load_remote_file_cache(cache_path, dataset)
+        if cached is not None:
+            _LOGGER.info(
+                "Using cached remote file listing dataset=%s repo=%s path=%s files=%s",
+                dataset.name,
+                dataset.resolve_repo_id(),
+                cache_path,
+                len(cached),
+            )
+            return cached
+
+        lock_path = cache_path.with_suffix(f"{cache_path.suffix}.lock")
+        with lock_path.open("w", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            cached = self._load_remote_file_cache(cache_path, dataset)
+            if cached is not None:
+                _LOGGER.info(
+                    "Using cached remote file listing dataset=%s repo=%s path=%s files=%s",
+                    dataset.name,
+                    dataset.resolve_repo_id(),
+                    cache_path,
+                    len(cached),
+                )
+                return cached
+
+            remote_files = self._list_repo_tree_files(dataset, token=token)
+            self._write_remote_file_cache(cache_path, dataset, remote_files)
+            return remote_files
+
+    def _list_repo_tree_files(
+        self,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None,
+    ) -> list[RemoteFile]:
+        tree = self.api.list_repo_tree(
+            repo_id=dataset.resolve_repo_id(),
+            repo_type=dataset.repo_type,
+            revision=dataset.revision,
+            recursive=True,
+            token=token,
+        )
+
+        remote_files: list[RemoteFile] = []
+        for entry in tree:
+            path = getattr(entry, "path", None)
+            size_bytes = getattr(entry, "size", None)
+            if path is None or size_bytes is None:
+                continue
+            remote_files.append(RemoteFile(path=str(path), size_bytes=int(size_bytes)))
+        remote_files.sort(key=lambda item: item.path)
+        return remote_files
+
+    def _remote_file_cache_path(self, cache_directory: Path, dataset: DatasetSpec) -> Path:
+        cache_key = "__".join(
+            [
+                dataset.name,
+                dataset.resolve_repo_id(),
+                dataset.repo_type,
+                dataset.revision,
+            ]
+        )
+        return cache_directory / f"{_slugify(cache_key)}.json"
+
+    def _load_remote_file_cache(
+        self,
+        cache_path: Path,
+        dataset: DatasetSpec,
+    ) -> list[RemoteFile] | None:
+        if not cache_path.exists():
+            return None
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            if raw.get("repo_id") != dataset.resolve_repo_id():
+                return None
+            if raw.get("repo_type") != dataset.repo_type:
+                return None
+            if raw.get("revision") != dataset.revision:
+                return None
+            return [
+                RemoteFile(
+                    path=str(item["path"]),
+                    size_bytes=int(item["size_bytes"]) if item.get("size_bytes") is not None else None,
+                )
+                for item in raw.get("files", [])
+            ]
+        except Exception as exc:
+            _LOGGER.warning(
+                "Ignoring unreadable remote file cache dataset=%s path=%s error=%s",
+                dataset.name,
+                cache_path,
+                exc,
+            )
+            return None
+
+    def _write_remote_file_cache(
+        self,
+        cache_path: Path,
+        dataset: DatasetSpec,
+        remote_files: list[RemoteFile],
+    ) -> None:
+        payload = {
+            "dataset": dataset.name,
+            "repo_id": dataset.resolve_repo_id(),
+            "repo_type": dataset.repo_type,
+            "revision": dataset.revision,
+            "created_at": _utc_now(),
+            "files": [
+                {
+                    "path": remote.path,
+                    "size_bytes": remote.size_bytes,
+                }
+                for remote in remote_files
+            ],
+        }
+        temp_path = cache_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(cache_path)
+        _LOGGER.info(
+            "Cached remote file listing dataset=%s repo=%s path=%s files=%s",
+            dataset.name,
+            dataset.resolve_repo_id(),
+            cache_path,
+            len(remote_files),
+        )
 
     def checkpoint_store(
         self,
@@ -357,6 +553,7 @@ class HuggingFaceDownloader:
         *,
         language: str | None = None,
         token: str | bool | None = None,
+        use_cache: bool = True,
     ) -> Path:
         _LOGGER.info(
             "Downloading remote file dataset=%s language=%s path=%s",
@@ -364,6 +561,23 @@ class HuggingFaceDownloader:
             language or "all",
             remote_path,
         )
+        if not use_cache and self._uses_default_download_file:
+            local_path = self._download_remote_file_direct(
+                config,
+                dataset,
+                remote_path,
+                language=language,
+                token=token,
+            )
+            _LOGGER.info(
+                "Finished direct download dataset=%s language=%s path=%s local_path=%s",
+                dataset.name,
+                language or "all",
+                remote_path,
+                local_path,
+            )
+            return local_path
+
         local_path = self.download_file(
             repo_id=dataset.resolve_repo_id(),
             filename=remote_path,
@@ -381,6 +595,77 @@ class HuggingFaceDownloader:
             local_path,
         )
         return Path(local_path)
+
+    def _download_remote_file_direct(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        remote_path: str,
+        *,
+        language: str | None,
+        token: str | bool | None,
+    ) -> Path:
+        target_path = self._download_root(config, dataset, language) / remote_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            return target_path
+
+        tmp_path = target_path.with_name(f"{target_path.name}.incomplete")
+        url = hf_hub_url(
+            repo_id=dataset.resolve_repo_id(),
+            filename=remote_path,
+            repo_type=dataset.repo_type,
+            revision=dataset.revision,
+        )
+        headers = build_hf_headers(token=token)
+        download_retries = _nonnegative_int_option(
+            dataset.extra.get("download_retries"),
+            dataset.extra.get("direct_download_retries"),
+            default=_DEFAULT_DIRECT_DOWNLOAD_RETRIES,
+        )
+        download_retry_backoff_seconds = _nonnegative_float_option(
+            dataset.extra.get("download_retry_backoff_seconds"),
+            dataset.extra.get("direct_download_retry_backoff_seconds"),
+            default=_DEFAULT_DIRECT_DOWNLOAD_RETRY_BACKOFF_SECONDS,
+        )
+        retries_used = 0
+        while True:
+            try:
+                with httpx.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=None,
+                ) as response:
+                    response.raise_for_status()
+                    with tmp_path.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            handle.write(chunk)
+                tmp_path.replace(target_path)
+                return target_path
+            except httpx.HTTPError as exc:
+                tmp_path.unlink(missing_ok=True)
+                if not _is_retryable_http_error(exc) or retries_used >= download_retries:
+                    raise
+
+                retries_used += 1
+                sleep_seconds = download_retry_backoff_seconds * retries_used
+                _LOGGER.warning(
+                    "Retrying direct download dataset=%s language=%s path=%s retry=%s/%s sleep_seconds=%.1f error=%s",
+                    dataset.name,
+                    language or "all",
+                    remote_path,
+                    retries_used,
+                    download_retries,
+                    sleep_seconds,
+                    exc,
+                )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
     def mark_file_completed(
         self,
@@ -449,8 +734,14 @@ class HuggingFaceDownloader:
         language: str | None = None,
         token: str | bool | None = None,
         max_files: int | None = None,
+        download_workers: int | None = None,
     ) -> DownloadSummary:
         config.ensure_directories()
+        worker_count = _positive_int_option(
+            download_workers,
+            dataset.extra.get("download_workers"),
+            default=1,
+        )
         plan = self.plan_download(
             config,
             dataset,
@@ -460,10 +751,11 @@ class HuggingFaceDownloader:
             checkpoint_namespace="downloads",
         )
         _LOGGER.info(
-            "Starting download dataset=%s language=%s pending_files=%s",
+            "Starting download dataset=%s language=%s pending_files=%s download_workers=%s",
             dataset.name,
             language or "all",
             len(plan.pending_files),
+            worker_count,
         )
         checkpoint_store = self.checkpoint_store(config, namespace="downloads")
         checkpoint = checkpoint_store.load(dataset.name, plan.repo_id, plan.revision, language)
@@ -471,17 +763,13 @@ class HuggingFaceDownloader:
         downloaded_paths: list[Path] = []
         plan.download_root.mkdir(parents=True, exist_ok=True)
 
-        for remote in plan.pending_files:
-            local_path = self.download_file(
-                repo_id=plan.repo_id,
-                filename=remote.path,
-                repo_type=dataset.repo_type,
-                revision=dataset.revision,
-                cache_dir=config.storage.huggingface_cache_directory,
-                local_dir=plan.download_root,
-                token=token,
-            )
-            downloaded_paths.append(Path(local_path))
+        for remote, local_path in self._download_pending_files(
+            plan,
+            dataset,
+            token=token,
+            worker_count=worker_count,
+        ):
+            downloaded_paths.append(local_path)
             if remote.path not in completed:
                 checkpoint.completed_files.append(remote.path)
                 completed.add(remote.path)
@@ -508,6 +796,78 @@ class HuggingFaceDownloader:
             downloaded_count=len(downloaded_paths),
             downloaded_files=downloaded_paths,
         )
+
+    def _download_pending_files(
+        self,
+        plan: DownloadPlan,
+        dataset: DatasetSpec,
+        *,
+        token: str | bool | None,
+        worker_count: int,
+    ) -> Iterator[tuple[RemoteFile, Path]]:
+        if worker_count == 1:
+            for remote in plan.pending_files:
+                yield (
+                    remote,
+                    self._download_plan_file(plan, dataset, remote, token=token),
+                )
+            return
+
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="commentminer-download",
+        )
+        remote_iter = iter(plan.pending_files)
+        pending: deque[tuple[RemoteFile, Future[Path]]] = deque()
+
+        def fill() -> None:
+            while len(pending) < worker_count:
+                try:
+                    remote = next(remote_iter)
+                except StopIteration:
+                    return
+                pending.append(
+                    (
+                        remote,
+                        executor.submit(
+                            self._download_plan_file,
+                            plan,
+                            dataset,
+                            remote,
+                            token=token,
+                        ),
+                    )
+                )
+
+        try:
+            fill()
+            while pending:
+                remote, future = pending.popleft()
+                yield remote, future.result()
+                fill()
+        finally:
+            for _, future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _download_plan_file(
+        self,
+        plan: DownloadPlan,
+        dataset: DatasetSpec,
+        remote: RemoteFile,
+        *,
+        token: str | bool | None,
+    ) -> Path:
+        local_path = self.download_file(
+            repo_id=plan.repo_id,
+            filename=remote.path,
+            repo_type=dataset.repo_type,
+            revision=dataset.revision,
+            cache_dir=plan.cache_directory,
+            local_dir=plan.download_root,
+            token=token,
+        )
+        return Path(local_path)
 
     def _download_root(
         self,
