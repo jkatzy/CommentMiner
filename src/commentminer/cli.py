@@ -20,6 +20,7 @@ from .license_scanner import scan_comment_licenses
 from .logging_utils import configure_logging
 from .pipeline import run_dataset
 from .sources import HuggingFaceParquetSource, StackV2SWHContentSource, UrlListJsonlSource
+from .stackv2_packages import mine_stack_v2_id_packages
 
 
 _DEFAULT_EXTRACTION_WORKERS = 4
@@ -264,6 +265,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-errors",
         action="store_true",
         help="Continue with the next slice when one dataset/language fails.",
+    )
+
+    stack_v2_packages = subparsers.add_parser(
+        "mine-stack-v2-packages",
+        help="Mine Stack v2 by fixed-size blob-id packages instead of language slices.",
+    )
+    stack_v2_packages.add_argument("config", type=Path)
+    stack_v2_packages.add_argument("dataset")
+    stack_v2_packages.add_argument("--languages", help="Comma-separated language names to include.")
+    stack_v2_packages.add_argument("--token-env")
+    stack_v2_packages.add_argument("--max-languages", type=int)
+    stack_v2_packages.add_argument("--max-files-per-language", type=int)
+    stack_v2_packages.add_argument("--max-packages", type=int)
+    stack_v2_packages.add_argument("--package-size", type=int, default=10_000)
+    stack_v2_packages.add_argument("--metadata-download-workers", type=int, default=4)
+    stack_v2_packages.add_argument("--package-workers", type=int, default=4)
+    stack_v2_packages.add_argument(
+        "--package-worker-backend",
+        choices=["thread", "process"],
+        help="Run package workers as threads or separate processes.",
+    )
+    stack_v2_packages.add_argument("--content-download-workers", type=int, default=2048)
+    stack_v2_packages.add_argument("--content-prefetch-records", type=int)
+    stack_v2_packages.add_argument("--extraction-workers", type=int, default=_DEFAULT_EXTRACTION_WORKERS)
+    stack_v2_packages.add_argument("--extraction-buffer", type=int)
+    stack_v2_packages.add_argument("--max-comment-start-row", type=int, default=10)
+    stack_v2_packages.add_argument("--cache-source-files", action="store_true")
+    stack_v2_packages.add_argument("--progress-every", type=int, default=1000)
+    stack_v2_packages.add_argument("--no-tqdm", action="store_true")
+    stack_v2_packages.add_argument(
+        "--rerun-completed-packages",
+        action="store_true",
+        help="Do not skip packages whose package checkpoint already covers every id.",
+    )
+    stack_v2_packages.add_argument(
+        "--skip-errors",
+        action="store_true",
+        help="Continue with the next id package when one package fails.",
     )
 
     export_hf = subparsers.add_parser(
@@ -781,6 +820,71 @@ def _mine_config(
     return 0
 
 
+
+def _mine_stack_v2_packages_command(
+    config_path: Path,
+    dataset_name: str,
+    *,
+    languages: list[str] | None,
+    token_env: str | None,
+    max_languages: int | None,
+    max_files_per_language: int | None,
+    max_packages: int | None,
+    package_size: int,
+    metadata_download_workers: int,
+    package_workers: int,
+    package_worker_backend: str | None,
+    content_download_workers: int,
+    content_prefetch_records: int | None,
+    extraction_workers: int,
+    extraction_buffer: int | None,
+    max_comment_start_row: int,
+    cache_source_files: bool,
+    progress_every: int,
+    show_progress: bool,
+    skip_completed_packages: bool,
+    skip_errors: bool,
+) -> int:
+    config = PipelineConfig.from_path(config_path)
+    dataset = config.require_dataset(dataset_name)
+    summary = mine_stack_v2_id_packages(
+        config,
+        dataset,
+        token=_resolve_token(token_env),
+        languages=languages,
+        max_languages=max_languages,
+        max_files_per_language=max_files_per_language,
+        max_packages=max_packages,
+        package_size=package_size,
+        metadata_download_workers=metadata_download_workers,
+        package_workers=package_workers,
+        package_worker_backend=package_worker_backend,
+        content_download_workers=content_download_workers,
+        content_prefetch_records=content_prefetch_records,
+        extraction_workers=extraction_workers,
+        extraction_buffer=extraction_buffer,
+        max_comment_start_row=max_comment_start_row,
+        cache_source_files=cache_source_files,
+        show_progress=show_progress,
+        progress_every=progress_every,
+        skip_completed_packages=skip_completed_packages,
+        skip_errors=skip_errors,
+    )
+    print(f"Dataset: {summary.dataset}")
+    print(f"Repo: {summary.repo_id} @ {summary.revision}")
+    print(f"Package size: {summary.package_size}")
+    print(f"Packages planned: {summary.packages_planned}")
+    print(f"Packages skipped: {summary.packages_skipped}")
+    print(f"Packages completed: {summary.packages_completed}")
+    print(f"IDs planned: {summary.ids_planned}")
+    print(f"Records seen: {summary.records_seen}")
+    print(f"Comments written: {summary.comments_written}")
+    if summary.failed_packages:
+        print("Failed packages:")
+        for package in summary.failed_packages:
+            print(f"- {package}")
+    return 0
+
 def _export_hf_dataset(
     config_path: Path,
     output_directory: Path,
@@ -923,6 +1027,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cache_source_files=args.cache_source_files,
                 progress_every=args.progress_every,
                 show_progress=not args.no_tqdm,
+                skip_errors=args.skip_errors,
+            )
+        if args.command == "mine-stack-v2-packages":
+            return _mine_stack_v2_packages_command(
+                args.config,
+                args.dataset,
+                languages=_split_csv(args.languages),
+                token_env=args.token_env,
+                max_languages=args.max_languages,
+                max_files_per_language=args.max_files_per_language,
+                max_packages=args.max_packages,
+                package_size=args.package_size,
+                metadata_download_workers=args.metadata_download_workers,
+                package_workers=args.package_workers,
+                package_worker_backend=args.package_worker_backend,
+                content_download_workers=args.content_download_workers,
+                content_prefetch_records=args.content_prefetch_records,
+                extraction_workers=args.extraction_workers,
+                extraction_buffer=args.extraction_buffer,
+                max_comment_start_row=args.max_comment_start_row,
+                cache_source_files=args.cache_source_files,
+                progress_every=args.progress_every,
+                show_progress=not args.no_tqdm,
+                skip_completed_packages=not args.rerun_completed_packages,
                 skip_errors=args.skip_errors,
             )
         if args.command == "export-hf-dataset":

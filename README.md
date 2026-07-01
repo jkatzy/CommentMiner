@@ -153,7 +153,19 @@ uv run commentminer mine-dataset config/pipeline.example.json the-stack-v2 \
   --token-env HF_TOKEN
 ```
 
-For The Stack v2, the Hugging Face parquet files contain Software Heritage IDs rather than source text. The Stack v2 adapter fetches complete source bytes from `s3://softwareheritage/content/{blob_id}` using unsigned S3 reads by default, decodes them with `src_encoding`, and does not persist source text. It uses a thread-backed S3 fetch queue, defaults to the fastest measured setting here of 32 S3 content download threads, can be raised explicitly to 1024 threads, retries transient DNS/socket/S3 failures, skips S3 reads for languages unsupported by the configured extractor, and records missing SWH objects as empty-content skips by default. `extra.content_prefetch_records` bounds queued or completed-but-not-yet-yielded rows, and should stay at least as large as `extra.content_download_workers`. Set `extra.aws_unsigned` to `false` if you need to use explicit AWS credentials instead.
+For The Stack v2, the Hugging Face parquet files contain Software Heritage IDs rather than source text. The Stack v2 adapter fetches complete source bytes from `http://softwareheritage.s3.amazonaws.com/content/{blob_id}` with aiohttp by default, decodes them with `src_encoding`, and does not persist source text. It retries transient DNS/socket/S3 failures, skips S3 reads for languages unsupported by the configured extractor, and records missing SWH objects as empty-content skips by default. `extra.content_prefetch_records` bounds queued or completed-but-not-yet-yielded rows, and should stay at least as large as `extra.content_download_workers`.
+
+For large Stack v2 runs, prefer package-based mining so work is balanced by fixed-size ID groups instead of by language. This mode first stages the Hugging Face metadata parquet shards, splits their `blob_id` rows into disjoint packages, and then runs packages through process workers. With `--package-worker-backend process`, each package process owns a bounded aiohttp pool; `--content-download-workers` is treated as the total content concurrency budget and is divided across package workers:
+
+```bash
+PACKAGE_SIZE=10000 \
+PACKAGE_WORKERS=64 \
+PACKAGE_WORKER_BACKEND=process \
+CONTENT_DOWNLOAD_WORKERS=2048 \
+scripts/run-stack-v2-id-packages.sh
+```
+
+The equivalent CLI is `uv run commentminer mine-stack-v2-packages config/pipeline.example.json the-stack-v2 --package-size 10000 --package-workers 64 --package-worker-backend process --content-download-workers 2048 --token-env HF_TOKEN`.
 
 Benchmark the Stack v2 processor path against a local metadata parquet shard while including Software Heritage source blob downloads:
 

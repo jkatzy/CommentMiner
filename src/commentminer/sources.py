@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import gzip
 import json
 import logging
 from pathlib import Path, PurePosixPath
 import random
-from threading import Lock
+from threading import Event, Lock, Thread
 import time
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol, Sequence
 from urllib.parse import urlparse
 
 try:
@@ -53,6 +54,7 @@ _DEFAULT_URL_STREAM_RETRY_BACKOFF_SECONDS = 10.0
 _DEFAULT_PREFETCH_FILES = 4
 _DEFAULT_DOWNLOAD_WORKERS = 4
 _DEFAULT_STACK_V2_CONTENT_URL_TEMPLATE = "s3://softwareheritage/content/{blob_id}"
+_DEFAULT_STACK_V2_AIOHTTP_CONTENT_URL_TEMPLATE = "http://softwareheritage.s3.amazonaws.com/content/{blob_id}"
 _DEFAULT_STACK_V2_CONTENT_COMPRESSION = ".gz"
 _DEFAULT_STACK_V2_CONTENT_DOWNLOAD_WORKERS = 32
 _DEFAULT_STACK_V2_CONTENT_PREFETCH_MULTIPLIER = 4
@@ -312,21 +314,21 @@ class HuggingFaceParquetSource:
         local_path: Any,
         resume_cursor: ShardRowCursor | None,
     ) -> Iterator[InputRecord]:
-        start_row = 0
-        if resume_cursor and resume_cursor.remote_path == remote.path:
-            start_row = resume_cursor.row_index + 1
+        start_row = self._start_row_for_remote(remote, resume_cursor)
+        stop_row = self._stop_row_for_remote(remote)
 
         parquet_file = pq.ParquetFile(local_path)
         _LOGGER.info(
-            "Reading parquet shard dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s",
+            "Reading parquet shard dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s stop_row=%s",
             self.dataset.name,
             self.language or "all",
             remote.path,
             parquet_file.metadata.num_rows if parquet_file.metadata is not None else "unknown",
             start_row,
+            stop_row if stop_row is not None else "end",
         )
         progress = tqdm(
-            total=parquet_file.metadata.num_rows if parquet_file.metadata is not None else None,
+            total=self._progress_total_rows(parquet_file, stop_row),
             initial=start_row,
             desc=_progress_description(self.dataset.name, remote.path),
             unit="rows",
@@ -342,6 +344,8 @@ class HuggingFaceParquetSource:
                 columns=columns,
             ):
                 for row in batch.to_pylist():
+                    if stop_row is not None and row_index >= stop_row:
+                        return
                     if row_index < start_row:
                         row_index += 1
                         continue
@@ -350,6 +354,30 @@ class HuggingFaceParquetSource:
                     row_index += 1
         finally:
             progress.close()
+
+    def _start_row_for_remote(
+        self,
+        remote: RemoteFile,
+        resume_cursor: ShardRowCursor | None,
+    ) -> int:
+        if resume_cursor and resume_cursor.remote_path == remote.path:
+            return resume_cursor.row_index + 1
+        return 0
+
+    def _stop_row_for_remote(self, remote: RemoteFile) -> int | None:
+        return None
+
+    def _progress_total_rows(
+        self,
+        parquet_file: pq.ParquetFile,
+        stop_row: int | None,
+    ) -> int | None:
+        total_rows = parquet_file.metadata.num_rows if parquet_file.metadata is not None else None
+        if stop_row is None:
+            return total_rows
+        if total_rows is None:
+            return stop_row
+        return min(total_rows, stop_row)
 
     def _row_to_input_record(
         self,
@@ -640,6 +668,432 @@ class SoftwareHeritageS3ContentFetcher:
         }
 
 
+class AiohttpSoftwareHeritageContentFetcher:
+    def __init__(
+        self,
+        *,
+        url_template: str = _DEFAULT_STACK_V2_AIOHTTP_CONTENT_URL_TEMPLATE,
+        compression: str | None = _DEFAULT_STACK_V2_CONTENT_COMPRESSION,
+        read_retries: int = _DEFAULT_STACK_V2_S3_READ_RETRIES,
+        retry_backoff_seconds: float = _DEFAULT_STACK_V2_S3_RETRY_BACKOFF_SECONDS,
+        dns_cache_seconds: int = 300,
+        decode_workers: int = 0,
+        decode_executor: str = "inline",
+    ) -> None:
+        decode_executor = decode_executor.lower()
+        if decode_executor not in {"inline", "thread", "process"}:
+            raise ValueError(
+                "decode_executor must be one of 'inline', 'thread', or 'process'"
+            )
+        self.url_template = url_template
+        self.compression = compression
+        self.read_retries = read_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.dns_cache_seconds = dns_cache_seconds
+        self.decode_workers = max(0, int(decode_workers))
+        self.decode_executor = decode_executor
+        self._pool_lock = Lock()
+        self._pool: _AiohttpSoftwareHeritageContentFetchPool | None = None
+
+    @classmethod
+    def from_dataset(cls, dataset: DatasetSpec) -> "AiohttpSoftwareHeritageContentFetcher":
+        return cls(
+            url_template=_optional_string(dataset.extra.get("swh_content_url_template"))
+            or _DEFAULT_STACK_V2_AIOHTTP_CONTENT_URL_TEMPLATE,
+            compression=_optional_string(
+                dataset.extra.get(
+                    "swh_content_compression",
+                    _DEFAULT_STACK_V2_CONTENT_COMPRESSION,
+                )
+            ),
+            read_retries=_nonnegative_int_option(
+                dataset.extra.get("s3_read_retries"),
+                dataset.extra.get("swh_s3_read_retries"),
+                default=_DEFAULT_STACK_V2_S3_READ_RETRIES,
+            ),
+            retry_backoff_seconds=_nonnegative_float_option(
+                dataset.extra.get("s3_retry_backoff_seconds"),
+                dataset.extra.get("swh_s3_retry_backoff_seconds"),
+                default=_DEFAULT_STACK_V2_S3_RETRY_BACKOFF_SECONDS,
+            ),
+            dns_cache_seconds=_positive_int_option(
+                dataset.extra.get("swh_http_dns_cache_seconds"),
+                default=300,
+            ),
+            decode_workers=_nonnegative_int_option(
+                dataset.extra.get("swh_content_decode_workers"),
+                dataset.extra.get("content_decode_workers"),
+                default=0,
+            ),
+            decode_executor=(
+                _optional_string(
+                    dataset.extra.get("swh_content_decode_executor")
+                    or dataset.extra.get("content_decode_executor")
+                )
+                or "inline"
+            ),
+        )
+
+    def fetch(self, blob_id: str, src_encoding: str | None) -> str:
+        result = self.fetch_many(
+            [(blob_id, src_encoding)],
+            concurrency=1,
+        )[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def fetch_many(
+        self,
+        requests: Sequence[tuple[str, str | None]],
+        *,
+        concurrency: int,
+    ) -> list[str | Exception]:
+        if not requests:
+            return []
+        concurrency = max(1, int(concurrency))
+        pool = self._fetch_pool(concurrency)
+        return pool.fetch_many(requests)
+
+    def close(self) -> None:
+        with self._pool_lock:
+            pool = self._pool
+            self._pool = None
+        if pool is not None:
+            pool.close()
+
+    def warm(self, *, concurrency: int) -> None:
+        self._fetch_pool(max(1, int(concurrency)))
+
+    def _fetch_pool(self, concurrency: int) -> "_AiohttpSoftwareHeritageContentFetchPool":
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = _AiohttpSoftwareHeritageContentFetchPool(
+                    self,
+                    concurrency=concurrency,
+                )
+            elif concurrency > self._pool.concurrency:
+                self._pool.ensure_concurrency(concurrency)
+            return self._pool
+
+    async def _fetch_many(
+        self,
+        requests: Sequence[tuple[str, str | None]],
+        *,
+        concurrency: int,
+    ) -> list[str | Exception]:
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise RuntimeError(
+                "Stack v2 aiohttp content fetching requires aiohttp. "
+                "Run `uv sync` so the aiohttp dependency is installed."
+            ) from exc
+
+        connector = aiohttp.TCPConnector(
+            limit=concurrency,
+            limit_per_host=0,
+            ttl_dns_cache=self.dns_cache_seconds,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=30,
+            sock_connect=30,
+            sock_read=120,
+        )
+        results: list[str | Exception] = [RuntimeError("fetch not started")] * len(requests)
+        queue: asyncio.Queue[tuple[int, str, str | None]] = asyncio.Queue()
+        for index, (blob_id, src_encoding) in enumerate(requests):
+            queue.put_nowait((index, blob_id, src_encoding))
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async def worker() -> None:
+                while True:
+                    try:
+                        index, blob_id, src_encoding = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        results[index] = await self._fetch_one(
+                            session,
+                            blob_id,
+                            src_encoding,
+                        )
+                    except Exception as exc:  # The caller maps errors to skip/retry policy.
+                        results[index] = exc
+                    finally:
+                        queue.task_done()
+
+            tasks = [
+                asyncio.create_task(worker())
+                for _ in range(min(concurrency, len(requests)))
+            ]
+            await queue.join()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+
+    async def _fetch_one(
+        self,
+        session: Any,
+        blob_id: str,
+        src_encoding: str | None,
+        *,
+        decode_executor: ThreadPoolExecutor | ProcessPoolExecutor | None = None,
+    ) -> str:
+        url = self.url_template.format(blob_id=blob_id)
+        attempt = 0
+        while True:
+            try:
+                raw = await self._read_http_bytes(session, url)
+                return await self._decode_http_bytes(
+                    raw,
+                    src_encoding,
+                    decode_executor=decode_executor,
+                )
+            except Exception as exc:
+                if (
+                    attempt >= self.read_retries
+                    or _is_missing_content_error(exc)
+                    or not _is_retryable_s3_content_error(exc)
+                ):
+                    raise
+                attempt += 1
+                sleep_seconds = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                sleep_seconds += random.uniform(0, self.retry_backoff_seconds)
+                _LOGGER.warning(
+                    "Retrying Stack v2 aiohttp content read blob_id=%s attempt=%s/%s sleep_seconds=%.2f error=%s",
+                    blob_id,
+                    attempt,
+                    self.read_retries,
+                    sleep_seconds,
+                    exc,
+                )
+                if sleep_seconds > 0:
+                    await asyncio.sleep(sleep_seconds)
+
+    async def _read_http_bytes(self, session: Any, url: str) -> bytes:
+        async with session.get(url) as response:
+            if response.status == 404:
+                raise FileNotFoundError(url)
+            response.raise_for_status()
+            return await response.read()
+
+    async def _decode_http_bytes(
+        self,
+        raw: bytes,
+        src_encoding: str | None,
+        *,
+        decode_executor: ThreadPoolExecutor | ProcessPoolExecutor | None,
+    ) -> str:
+        if decode_executor is None:
+            return _decode_stack_v2_raw_content(raw, self.compression, src_encoding)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            decode_executor,
+            _decode_stack_v2_raw_content,
+            raw,
+            self.compression,
+            src_encoding,
+        )
+
+    def worker_kwargs(self) -> dict[str, Any]:
+        return {
+            "url_template": self.url_template,
+            "compression": self.compression,
+            "read_retries": self.read_retries,
+            "retry_backoff_seconds": self.retry_backoff_seconds,
+            "dns_cache_seconds": self.dns_cache_seconds,
+            "decode_workers": self.decode_workers,
+            "decode_executor": self.decode_executor,
+        }
+
+
+class _AiohttpSoftwareHeritageContentFetchPool:
+    def __init__(
+        self,
+        fetcher: AiohttpSoftwareHeritageContentFetcher,
+        *,
+        concurrency: int,
+    ) -> None:
+        self.fetcher = fetcher
+        self.concurrency = 0
+        self._requested_concurrency = concurrency
+        self._decode_executor = self._build_decode_executor()
+        self._loop = asyncio.new_event_loop()
+        self._ready = Event()
+        self._close_lock = Lock()
+        self._closed = False
+        self._startup_error: BaseException | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="commentminer-stack-v2-aiohttp-content",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait()
+        if self._startup_error is not None:
+            if self._decode_executor is not None:
+                self._decode_executor.shutdown(wait=True, cancel_futures=True)
+            raise RuntimeError("Failed to start Stack v2 aiohttp content pool") from self._startup_error
+
+    def fetch_many(self, requests: Sequence[tuple[str, str | None]]) -> list[str | Exception]:
+        if self._closed:
+            raise RuntimeError("Stack v2 aiohttp content pool is closed")
+        request_list = list(requests)
+        future = asyncio.run_coroutine_threadsafe(
+            self._submit_many(request_list),
+            self._loop,
+        )
+        try:
+            return list(future.result())
+        except BaseException:
+            future.cancel()
+            raise
+
+    def ensure_concurrency(self, concurrency: int) -> None:
+        if concurrency <= self.concurrency:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._ensure_workers(concurrency),
+            self._loop,
+        )
+        future.result()
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        future = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+        try:
+            future.result()
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._start())
+        except BaseException as exc:  # pragma: no cover - exercised only on aiohttp import/startup failure.
+            self._startup_error = exc
+            self._ready.set()
+            self._loop.close()
+            return
+        self._ready.set()
+        self._loop.run_forever()
+        self._loop.close()
+
+    async def _start(self) -> None:
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise RuntimeError(
+                "Stack v2 aiohttp content fetching requires aiohttp. "
+                "Run `uv sync` so the aiohttp dependency is installed."
+            ) from exc
+
+        connector = aiohttp.TCPConnector(
+            limit=0,
+            limit_per_host=0,
+            ttl_dns_cache=self.fetcher.dns_cache_seconds,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=30,
+            sock_connect=30,
+            sock_read=120,
+        )
+        self._queue: asyncio.Queue[
+            tuple[asyncio.Future[str | Exception], str, str | None] | None
+        ] = asyncio.Queue()
+        self._workers: list[asyncio.Task[None]] = []
+        self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        await self._ensure_workers(self._requested_concurrency)
+
+    async def _ensure_workers(self, concurrency: int) -> None:
+        while len(self._workers) < concurrency:
+            self._workers.append(asyncio.create_task(self._worker()))
+        self.concurrency = len(self._workers)
+
+    async def _submit_many(
+        self,
+        requests: Sequence[tuple[str, str | None]],
+    ) -> list[str | Exception]:
+        loop = asyncio.get_running_loop()
+        futures: list[asyncio.Future[str | Exception]] = []
+        for blob_id, src_encoding in requests:
+            future: asyncio.Future[str | Exception] = loop.create_future()
+            futures.append(future)
+            self._queue.put_nowait((future, blob_id, src_encoding))
+        return list(await asyncio.gather(*futures))
+
+    async def _worker(self) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is None:
+                    return
+                future, blob_id, src_encoding = item
+                if future.cancelled():
+                    continue
+                try:
+                    result: str | Exception = await self.fetcher._fetch_one(
+                        self._session,
+                        blob_id,
+                        src_encoding,
+                        decode_executor=self._decode_executor,
+                    )
+                except Exception as exc:  # The caller maps errors to skip/retry policy.
+                    result = exc
+                if not future.done():
+                    future.set_result(result)
+            finally:
+                self._queue.task_done()
+
+    async def _shutdown(self) -> None:
+        for _ in self._workers:
+            self._queue.put_nowait(None)
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        await self._session.close()
+        if self._decode_executor is not None:
+            self._decode_executor.shutdown(wait=True, cancel_futures=True)
+
+    def _build_decode_executor(
+        self,
+    ) -> ThreadPoolExecutor | ProcessPoolExecutor | None:
+        if self.fetcher.decode_workers < 1 or self.fetcher.decode_executor == "inline":
+            return None
+        if self.fetcher.decode_executor == "process":
+            return ProcessPoolExecutor(max_workers=self.fetcher.decode_workers)
+        return ThreadPoolExecutor(
+            max_workers=self.fetcher.decode_workers,
+            thread_name_prefix="commentminer-stack-v2-decode",
+        )
+
+
+def _stack_v2_content_fetcher_from_dataset(
+    dataset: DatasetSpec,
+    *,
+    min_pool_connections: int | None,
+) -> StackV2ContentFetcher:
+    client = _optional_string(
+        dataset.extra.get("swh_content_client")
+        or dataset.extra.get("content_fetch_client")
+        or dataset.extra.get("content_download_client")
+    )
+    if client is not None and client.lower() in {"aiohttp", "async_http", "async-http"}:
+        return AiohttpSoftwareHeritageContentFetcher.from_dataset(dataset)
+    return SoftwareHeritageS3ContentFetcher.from_dataset(
+        dataset,
+        min_pool_connections=min_pool_connections,
+    )
+
+
 class StackV2SWHContentSource(HuggingFaceParquetSource):
     """Stack v2 adapter that hydrates source text from Software Heritage S3 blobs."""
 
@@ -657,6 +1111,7 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
         download_workers: int | None = None,
         cache_source_files: bool | None = None,
         content_fetcher: StackV2ContentFetcher | None = None,
+        content_executor: ThreadPoolExecutor | None = None,
         content_download_workers: int | None = None,
         content_prefetch_records: int | None = None,
         content_language_filter: Callable[[str], bool] | None = None,
@@ -690,10 +1145,11 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
             dataset.extra.get("swh_content_prefetch_records"),
             default=self.content_download_workers * _DEFAULT_STACK_V2_CONTENT_PREFETCH_MULTIPLIER,
         )
-        self.content_fetcher = content_fetcher or SoftwareHeritageS3ContentFetcher.from_dataset(
+        self.content_fetcher = content_fetcher or _stack_v2_content_fetcher_from_dataset(
             dataset,
             min_pool_connections=self.content_download_workers,
         )
+        self.content_executor = content_executor
         if isinstance(self.content_fetcher, SoftwareHeritageS3ContentFetcher):
             self.content_fetcher.s3_max_pool_connections = max(
                 self.content_fetcher.s3_max_pool_connections,
@@ -719,27 +1175,30 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
         local_path: Any,
         resume_cursor: ShardRowCursor | None,
     ) -> Iterator[InputRecord]:
+        if isinstance(self.content_fetcher, AiohttpSoftwareHeritageContentFetcher):
+            yield from self._iter_file_records_aiohttp(remote, local_path, resume_cursor)
+            return
         if self.content_download_workers == 1:
             yield from super()._iter_file_records(remote, local_path, resume_cursor)
             return
 
-        start_row = 0
-        if resume_cursor and resume_cursor.remote_path == remote.path:
-            start_row = resume_cursor.row_index + 1
+        start_row = self._start_row_for_remote(remote, resume_cursor)
+        stop_row = self._stop_row_for_remote(remote)
 
         parquet_file = pq.ParquetFile(local_path)
         _LOGGER.info(
-            "Reading Stack v2 parquet shard dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s content_download_workers=%s content_prefetch_records=%s",
+            "Reading Stack v2 parquet shard dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s stop_row=%s content_download_workers=%s content_prefetch_records=%s",
             self.dataset.name,
             self.language or "all",
             remote.path,
             parquet_file.metadata.num_rows if parquet_file.metadata is not None else "unknown",
             start_row,
+            stop_row if stop_row is not None else "end",
             self.content_download_workers,
             self.content_prefetch_records,
         )
         progress = tqdm(
-            total=parquet_file.metadata.num_rows if parquet_file.metadata is not None else None,
+            total=self._progress_total_rows(parquet_file, stop_row),
             initial=start_row,
             desc=_progress_description(self.dataset.name, remote.path),
             unit="rows",
@@ -750,7 +1209,8 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
         pending: dict[Future[str], _StackV2PendingContentFetch] = {}
         ready: dict[int, tuple[dict[str, Any], str, str]] = {}
         executor = self._content_download_executor()
-        rows = self._iter_parquet_rows(parquet_file, start_row)
+        owns_executor = executor is not self.content_executor
+        rows = self._iter_parquet_rows(parquet_file, start_row, stop_row=stop_row)
         source_exhausted = False
         next_yield_row = start_row
 
@@ -834,9 +1294,108 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
             progress.close()
             for future in pending:
                 future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
+            if owns_executor:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+    def _iter_file_records_aiohttp(
+        self,
+        remote: RemoteFile,
+        local_path: Any,
+        resume_cursor: ShardRowCursor | None,
+    ) -> Iterator[InputRecord]:
+        start_row = self._start_row_for_remote(remote, resume_cursor)
+        stop_row = self._stop_row_for_remote(remote)
+
+        parquet_file = pq.ParquetFile(local_path)
+        _LOGGER.info(
+            "Reading Stack v2 parquet shard with aiohttp dataset=%s language=%s remote_path=%s total_rows=%s start_row=%s stop_row=%s content_download_workers=%s content_prefetch_records=%s",
+            self.dataset.name,
+            self.language or "all",
+            remote.path,
+            parquet_file.metadata.num_rows if parquet_file.metadata is not None else "unknown",
+            start_row,
+            stop_row if stop_row is not None else "end",
+            self.content_download_workers,
+            self.content_prefetch_records,
+        )
+        progress = tqdm(
+            total=self._progress_total_rows(parquet_file, stop_row),
+            initial=start_row,
+            desc=_progress_description(self.dataset.name, remote.path),
+            unit="rows",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+        )
+        rows = self._iter_parquet_rows(parquet_file, start_row, stop_row=stop_row)
+        try:
+            while True:
+                batch: list[tuple[int, dict[str, Any]]] = []
+                while len(batch) < self.content_prefetch_records:
+                    try:
+                        batch.append(next(rows))
+                    except StopIteration:
+                        break
+                if not batch:
+                    return
+
+                fetch_requests: list[tuple[str, str | None]] = []
+                request_indexes: list[int] = []
+                ready: dict[int, tuple[dict[str, Any], str, str]] = {}
+                for batch_index, (row_index, row) in enumerate(batch):
+                    if not self._should_fetch_content(row):
+                        ready[batch_index] = (row, "", "unsupported_language")
+                        continue
+                    fetch_requests.append(
+                        self._content_fetch_request(
+                            remote.path,
+                            row_index,
+                            row,
+                        )
+                    )
+                    request_indexes.append(batch_index)
+
+                assert isinstance(self.content_fetcher, AiohttpSoftwareHeritageContentFetcher)
+                fetch_results = self.content_fetcher.fetch_many(
+                    fetch_requests,
+                    concurrency=self.content_download_workers,
+                )
+                for batch_index, fetch_request, result in zip(
+                    request_indexes,
+                    fetch_requests,
+                    fetch_results,
+                    strict=True,
+                ):
+                    row_index, row = batch[batch_index]
+                    blob_id = fetch_request[0]
+                    if isinstance(result, Exception):
+                        content, content_fetch_status = self._content_after_fetch_error(
+                            result,
+                            remote.path,
+                            row_index,
+                            blob_id,
+                        )
+                    else:
+                        content = result
+                        content_fetch_status = "fetched"
+                    ready[batch_index] = (row, content, content_fetch_status)
+
+                for batch_index, (row_index, _) in enumerate(batch):
+                    row, content, content_fetch_status = ready[batch_index]
+                    progress.update(1)
+                    yield self._row_to_input_record_with_content(
+                        remote.path,
+                        row_index,
+                        row,
+                        content,
+                        content_fetch_status=content_fetch_status,
+                    )
+        finally:
+            progress.close()
 
     def _content_download_executor(self) -> ThreadPoolExecutor:
+        if self.content_executor is not None:
+            return self.content_executor
         return ThreadPoolExecutor(
             max_workers=self.content_download_workers,
             thread_name_prefix="commentminer-stack-v2-content",
@@ -846,14 +1405,25 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
         self,
         parquet_file: pq.ParquetFile,
         start_row: int,
+        *,
+        stop_row: int | None = None,
     ) -> Iterator[tuple[int, dict[str, Any]]]:
-        row_index = 0
         columns = self._selected_parquet_columns(parquet_file)
+        row_groups, row_index = _parquet_row_groups_for_range(
+            parquet_file,
+            start_row,
+            stop_row,
+        )
+        if row_groups == []:
+            return
         for batch in parquet_file.iter_batches(
             batch_size=self.dataset.batch_size,
             columns=columns,
+            row_groups=row_groups,
         ):
             for row in batch.to_pylist():
+                if stop_row is not None and row_index >= stop_row:
+                    return
                 if row_index >= start_row:
                     yield row_index, row
                 row_index += 1
@@ -1396,11 +1966,50 @@ def _decode_jsonl_line(line: bytes) -> str:
     return line.decode("utf-8")
 
 
+def _decode_stack_v2_raw_content(
+    raw: bytes,
+    compression: str | None,
+    src_encoding: str | None,
+) -> str:
+    if compression == ".gz":
+        raw = gzip.decompress(raw)
+    return _decode_source_bytes(raw, src_encoding)
+
+
 def _is_retryable_http_error(exc: httpx.HTTPError) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         return status_code == 408 or status_code == 429 or status_code >= 500
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+def _parquet_row_groups_for_range(
+    parquet_file: pq.ParquetFile,
+    start_row: int,
+    stop_row: int | None,
+) -> tuple[list[int] | None, int]:
+    metadata = parquet_file.metadata
+    if metadata is None:
+        return None, 0
+    if start_row <= 0 and stop_row is None:
+        return None, 0
+
+    row_groups: list[int] = []
+    row_group_start = 0
+    first_row_index = 0
+    for row_group_index in range(metadata.num_row_groups):
+        row_group_rows = metadata.row_group(row_group_index).num_rows
+        row_group_end = row_group_start + row_group_rows
+        intersects_start = row_group_end > start_row
+        intersects_stop = stop_row is None or row_group_start < stop_row
+        if intersects_start and intersects_stop:
+            if not row_groups:
+                first_row_index = row_group_start
+            row_groups.append(row_group_index)
+        row_group_start = row_group_end
+        if stop_row is not None and row_group_start >= stop_row:
+            break
+    return row_groups, first_row_index
 
 
 def _is_missing_content_error(exc: Exception) -> bool:
@@ -1425,6 +2034,14 @@ def _is_missing_content_error(exc: Exception) -> bool:
 def _is_retryable_s3_content_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPError):
         return _is_retryable_http_error(exc)
+    status = getattr(exc, "status", None)
+    if status in {408, 429} or (isinstance(status, int) and status >= 500):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 429} or (
+        isinstance(status_code, int) and status_code >= 500
+    ):
+        return True
     if isinstance(exc, (TimeoutError, OSError)):
         return True
 

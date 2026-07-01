@@ -59,13 +59,15 @@
         "content_backend": "softwareheritage_s3",
         "blob_id_column": "blob_id",
         "src_encoding_column": "src_encoding",
-        "swh_content_url_template": "s3://softwareheritage/content/{blob_id}",
+        "swh_content_client": "aiohttp",
+        "swh_content_url_template": "http://softwareheritage.s3.amazonaws.com/content/{blob_id}",
         "swh_content_compression": ".gz",
+        "package_worker_backend": "process",
         "swh_s3_max_pool_connections": 1024,
         "swh_s3_read_retries": 6,
         "swh_s3_retry_backoff_seconds": 0.25,
-        "content_download_workers": 32,
-        "content_prefetch_records": 128,
+        "content_download_workers": 2048,
+        "content_prefetch_records": 20000,
         "swh_skip_missing_content": true,
         "aws_unsigned": true,
         "content_columns": ["content", "text"],
@@ -78,7 +80,7 @@
         "extraction_workers": 4,
         "extraction_buffer": 16,
         "cache_source_files": false,
-        "notes": "The Stack v2 Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from s3://softwareheritage/content/{blob_id} with unsigned S3 reads by default; accept the HF terms and pass HF_TOKEN when needed."
+        "notes": "The Stack v2 Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from the public Software Heritage S3 HTTP endpoint with aiohttp by default. Package-process mining duplicates bounded aiohttp pools across disjoint ID packages to use multiple CPU cores while keeping total content concurrency capped; accept the HF terms and authenticate with Hugging Face when needed."
       }
     },
     {

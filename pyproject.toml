@@ -9,6 +9,7 @@ description = "Storage-aware pipeline scaffolding for mining opening comments fr
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.9,<4",
     "huggingface-hub>=1,<2",
     "httpx>=0.28,<1",
     "ml4setk",
