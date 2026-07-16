@@ -1847,7 +1847,7 @@ class _RemoteDownloadScheduler:
             if future.cancelled() or not future.done():
                 continue
             try:
-                local_path = future.result()
+                future.result()
             except Exception:
                 continue
             if self.source.dataset.streaming:

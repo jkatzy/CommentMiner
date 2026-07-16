@@ -16,6 +16,10 @@ dependencies = [
     "pyarrow>=18,<20",
     "smart-open[s3]>=7,<8",
     "tqdm>=4.66,<5",
+    "scancode-toolkit>=32.5.0",
+    "numpy>=2,<3",
+    "bertopic>=0.17.4",
+    "sentence-transformers>=5,<6",
 ]
 
 [dependency-groups]

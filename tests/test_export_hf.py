@@ -90,6 +90,133 @@ class HuggingFaceExportTests(unittest.TestCase):
             self.assertEqual(manifest["layout"], "<dataset>/<language>/part-*.parquet")
             self.assertIn("the-heap__ANTLR", (destination / "README.md").read_text(encoding="utf-8"))
 
+    def test_export_can_write_language_split_dataset_card(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            mined = root / "output"
+            destination = root / "comment-dataset"
+            _write_jsonl(
+                mined / "the-stack-v2-dedup-package-1" / "20260620T000000Z" / "part-00000.jsonl",
+                [
+                    {
+                        "dataset": "the-stack-v2-dedup",
+                        "record_id": "cpp-1",
+                        "opening_comment": "// header",
+                        "language": "C++",
+                        "path": "main.cpp",
+                        "repo": "owner/repo",
+                        "metadata": {},
+                    },
+                    {
+                        "dataset": "the-stack-v2-dedup",
+                        "record_id": "csharp-1",
+                        "opening_comment": "// header",
+                        "language": "C#",
+                        "path": "Program.cs",
+                        "repo": "owner/repo",
+                        "metadata": {},
+                    },
+                ],
+            )
+
+            export_huggingface_dataset(
+                mined,
+                destination,
+                output_format="parquet",
+                max_records_per_shard=100,
+                max_bytes_per_shard=1024 * 1024,
+                dataset_card_layout="language-splits",
+            )
+
+            readme = (destination / "README.md").read_text(encoding="utf-8")
+            self.assertIn('config_name: "the-stack-v2-dedup"', readme)
+            self.assertIn('split: "C_plus_plus"', readme)
+            self.assertIn('path: "the-stack-v2-dedup/C++/part-*.parquet"', readme)
+            self.assertIn('split: "C_sharp"', readme)
+            manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["dataset_card_layout"], "language-splits")
+
+    def test_export_can_dedupe_within_input_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            mined = root / "output"
+            destination = root / "comment-dataset"
+            row = {
+                "dataset": "the-stack-v2-dedup",
+                "record_id": "row-1",
+                "opening_comment": "// header",
+                "language": "Python",
+                "path": "a.py",
+                "repo": "owner/repo",
+                "metadata": {},
+            }
+            _write_jsonl(
+                mined / "package-1" / "20260620T000000Z" / "part-00000.jsonl",
+                [row, row],
+            )
+            _write_jsonl(
+                mined / "package-2" / "20260620T000000Z" / "part-00000.jsonl",
+                [row],
+            )
+
+            stats = export_huggingface_dataset(
+                mined,
+                destination,
+                output_format="parquet",
+                max_records_per_shard=100,
+                max_bytes_per_shard=1024 * 1024,
+                dedupe_record_ids=True,
+                dedupe_scope="input-group",
+            )
+
+            self.assertEqual(stats.records_written, 2)
+            self.assertEqual(stats.records_skipped_duplicate, 1)
+            shard = destination / "the-stack-v2-dedup" / "Python" / "part-00000.parquet"
+            self.assertEqual(len(pq.read_table(shard).to_pylist()), 2)
+
+    def test_export_can_write_parallel_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            mined = root / "output"
+            destination = root / "comment-dataset"
+            for index in range(4):
+                _write_jsonl(
+                    mined / f"package-{index}" / "20260620T000000Z" / "part-00000.jsonl",
+                    [
+                        {
+                            "dataset": "the-stack-v2-dedup",
+                            "record_id": f"row-{index}",
+                            "opening_comment": "// header",
+                            "language": "Python",
+                            "path": f"{index}.py",
+                            "repo": "owner/repo",
+                            "metadata": {},
+                        }
+                    ],
+                )
+
+            stats = export_huggingface_dataset(
+                mined,
+                destination,
+                output_format="parquet",
+                max_records_per_shard=2,
+                max_bytes_per_shard=1024 * 1024,
+                dedupe_record_ids=True,
+                dedupe_scope="input-group",
+                workers=2,
+                max_open_writers=2,
+            )
+
+            self.assertEqual(stats.records_written, 4)
+            shards = sorted((destination / "the-stack-v2-dedup" / "Python").glob("part-*.parquet"))
+            self.assertGreaterEqual(len(shards), 2)
+            self.assertTrue(any(path.name.startswith("part-00000-") for path in shards))
+            self.assertTrue(any(path.name.startswith("part-00001-") for path in shards))
+            rows = []
+            for shard in shards:
+                rows.extend(pq.read_table(shard).to_pylist())
+            self.assertEqual(sorted(row["record_id"] for row in rows), ["row-0", "row-1", "row-2", "row-3"])
+
 
 if __name__ == "__main__":
     unittest.main()

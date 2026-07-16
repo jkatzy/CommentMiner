@@ -7,6 +7,7 @@ package_size="${PACKAGE_SIZE:-10000}"
 metadata_download_workers="${METADATA_DOWNLOAD_WORKERS:-4}"
 package_workers="${PACKAGE_WORKERS:-64}"
 package_worker_backend="${PACKAGE_WORKER_BACKEND:-process}"
+package_worker_max_tasks_per_child="${PACKAGE_WORKER_MAX_TASKS_PER_CHILD:-}"
 content_download_workers="${CONTENT_DOWNLOAD_WORKERS:-2048}"
 content_prefetch_records="${CONTENT_PREFETCH_RECORDS:-}"
 extraction_workers="${EXTRACTION_WORKERS:-4}"
@@ -35,6 +36,9 @@ args=(
 
 if [[ -n "$content_prefetch_records" ]]; then
   args+=(--content-prefetch-records "$content_prefetch_records")
+fi
+if [[ -n "$package_worker_max_tasks_per_child" ]]; then
+  args+=(--package-worker-max-tasks-per-child "$package_worker_max_tasks_per_child")
 fi
 if [[ -n "$extraction_buffer" ]]; then
   args+=(--extraction-buffer "$extraction_buffer")
@@ -70,6 +74,7 @@ printf "Package size: %s ids\n" "$package_size"
 printf "Metadata download workers: %s\n" "$metadata_download_workers"
 printf "Package workers: %s\n" "$package_workers"
 printf "Package worker backend: %s\n" "$package_worker_backend"
+printf "Package worker max tasks per child: %s\n" "${package_worker_max_tasks_per_child:-default}"
 printf "Total S3 content download workers: %s\n" "$content_download_workers"
 
 exec "${args[@]}"

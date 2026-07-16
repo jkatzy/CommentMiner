@@ -4,11 +4,13 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
+import gc
 import hashlib
 import logging
 from pathlib import Path
 from typing import Callable, Sequence
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import DatasetSpec, PipelineConfig
@@ -19,7 +21,6 @@ from .pipeline import CheckpointStore, PipelineRunStats, run_dataset
 from .sources import (
     AiohttpSoftwareHeritageContentFetcher,
     ShardRowCursor,
-    SoftwareHeritageS3ContentFetcher,
     StackV2ContentFetcher,
     StackV2SWHContentSource,
     _raise_fd_limit_for_stack_v2_content_workers,
@@ -339,6 +340,7 @@ def mine_stack_v2_id_packages(
     metadata_download_workers: int = 4,
     package_workers: int = 4,
     package_worker_backend: str | None = None,
+    package_worker_max_tasks_per_child: int | None = None,
     content_download_workers: int = 2048,
     content_prefetch_records: int | None = None,
     extraction_workers: int = 1,
@@ -358,6 +360,12 @@ def mine_stack_v2_id_packages(
         dataset.extra.get("package_worker_backend"),
         dataset.extra.get("stack_v2_package_worker_backend"),
         default="thread",
+    )
+    package_worker_max_tasks_per_child = _package_worker_max_tasks_per_child_option(
+        package_worker_max_tasks_per_child,
+        dataset.extra.get("package_worker_max_tasks_per_child"),
+        dataset.extra.get("stack_v2_package_worker_max_tasks_per_child"),
+        default=1 if package_worker_backend == "process" else None,
     )
     content_download_workers = _require_positive_int(
         "content_download_workers",
@@ -468,6 +476,7 @@ def mine_stack_v2_id_packages(
             token=token,
             package_workers=package_workers,
             package_worker_backend=package_worker_backend,
+            package_worker_max_tasks_per_child=package_worker_max_tasks_per_child,
             content_download_workers=package_content_workers,
             content_prefetch_records=content_prefetch_records,
             content_fetcher=shared_fetcher,
@@ -625,6 +634,7 @@ def _run_packages(
     token: str | bool | None,
     package_workers: int,
     package_worker_backend: str,
+    package_worker_max_tasks_per_child: int | None,
     content_download_workers: int,
     content_prefetch_records: int,
     content_fetcher: StackV2ContentFetcher | None,
@@ -638,50 +648,32 @@ def _run_packages(
     progress_every: int,
     skip_errors: bool,
 ) -> tuple[list[PipelineRunStats], list[str]]:
-    if package_workers == 1:
+    if package_workers == 1 and package_worker_backend != "process":
         stats: list[PipelineRunStats] = []
         failed_packages: list[str] = []
         for package in packages:
             try:
-                if package_worker_backend == "process":
-                    stats.append(
-                        _run_package_process(
-                            config,
-                            dataset,
-                            package,
-                            token=token,
-                            content_download_workers=content_download_workers,
-                            content_prefetch_records=content_prefetch_records,
-                            extractor_factory=extractor_factory,
-                            extraction_workers=extraction_workers,
-                            extraction_buffer=extraction_buffer,
-                            cache_source_files=cache_source_files,
-                            show_progress=show_progress,
-                            progress_every=progress_every,
-                        )
+                assert content_fetcher is not None
+                stats.append(
+                    _run_package(
+                        config,
+                        dataset,
+                        package,
+                        downloader=downloader,
+                        token=token,
+                        content_download_workers=content_download_workers,
+                        content_prefetch_records=content_prefetch_records,
+                        content_fetcher=content_fetcher,
+                        content_executor=content_executor,
+                        content_language_filter=content_language_filter,
+                        extractor=extractor_factory(),
+                        extraction_workers=extraction_workers,
+                        extraction_buffer=extraction_buffer,
+                        cache_source_files=cache_source_files,
+                        show_progress=show_progress,
+                        progress_every=progress_every,
                     )
-                else:
-                    assert content_fetcher is not None
-                    stats.append(
-                        _run_package(
-                            config,
-                            dataset,
-                            package,
-                            downloader=downloader,
-                            token=token,
-                            content_download_workers=content_download_workers,
-                            content_prefetch_records=content_prefetch_records,
-                            content_fetcher=content_fetcher,
-                            content_executor=content_executor,
-                            content_language_filter=content_language_filter,
-                            extractor=extractor_factory(),
-                            extraction_workers=extraction_workers,
-                            extraction_buffer=extraction_buffer,
-                            cache_source_files=cache_source_files,
-                            show_progress=show_progress,
-                            progress_every=progress_every,
-                        )
-                    )
+                )
             except Exception:
                 if not skip_errors:
                     raise
@@ -693,8 +685,14 @@ def _run_packages(
     run_stats: list[PipelineRunStats] = []
     failed_packages: list[str] = []
     pending: dict[Future[PipelineRunStats], StackV2IdPackage] = {}
+    process_executor_kwargs = (
+        {"max_tasks_per_child": package_worker_max_tasks_per_child}
+        if package_worker_backend == "process"
+        and package_worker_max_tasks_per_child is not None
+        else {}
+    )
     executor_context = (
-        ProcessPoolExecutor(max_workers=package_workers)
+        ProcessPoolExecutor(max_workers=package_workers, **process_executor_kwargs)
         if package_worker_backend == "process"
         else ThreadPoolExecutor(
             max_workers=package_workers,
@@ -806,6 +804,7 @@ def _run_package_process(
     finally:
         if isinstance(content_fetcher, AiohttpSoftwareHeritageContentFetcher):
             content_fetcher.close()
+        _release_package_worker_memory()
 
 
 def _run_package(
@@ -881,6 +880,14 @@ def _default_opening_comment_extractor(max_comment_start_row: int) -> CommentExt
     return ML4SEOpeningCommentExtractor(max_start_row=max_comment_start_row)
 
 
+def _release_package_worker_memory() -> None:
+    gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:  # pragma: no cover - depends on optional Arrow allocator support.
+        _LOGGER.debug("Unable to release unused PyArrow memory", exc_info=True)
+
+
 def _package_worker_backend_option(*values: str | None, default: str) -> str:
     for value in values:
         if value is None:
@@ -893,6 +900,22 @@ def _package_worker_backend_option(*values: str | None, default: str) -> str:
                 f"package_worker_backend must be 'thread' or 'process', got {value!r}"
             )
         return result
+    return default
+
+
+def _package_worker_max_tasks_per_child_option(
+    *values: object,
+    default: int | None,
+) -> int | None:
+    for value in values:
+        if value is None:
+            continue
+        result = int(value)
+        if result < 0:
+            raise ValueError(
+                "package_worker_max_tasks_per_child must be non-negative"
+            )
+        return result or None
     return default
 
 

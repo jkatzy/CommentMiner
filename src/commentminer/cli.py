@@ -14,13 +14,24 @@ from .aggregation import aggregate_comment_runs
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .deduplication import deduplicate_comment_run
+from .encoding_benchmark import (
+    load_encoding_model_specs,
+    run_encoding_capacity_benchmark,
+)
 from .export_hf import export_huggingface_dataset
 from .extractors import ML4SEOpeningCommentExtractor
-from .license_scanner import scan_comment_licenses
+from .license_scanner import (
+    build_license_score_histogram,
+    format_license_score_histogram,
+    prewarm_huggingface_license_detection_cache,
+    scan_comment_licenses,
+    scan_huggingface_comment_licenses,
+)
 from .logging_utils import configure_logging
 from .pipeline import run_dataset
 from .sources import HuggingFaceParquetSource, StackV2SWHContentSource, UrlListJsonlSource
 from .stackv2_packages import mine_stack_v2_id_packages
+from .topic_modelling import run_low_scancode_topic_modelling
 
 
 _DEFAULT_EXTRACTION_WORKERS = 4
@@ -187,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hash-workers",
         type=int,
         default=max(1, min(8, os.cpu_count() or 1)),
-        help="Number of worker threads to use while normalizing and hashing comments.",
+        help="Number of worker processes to use while normalizing and hashing comments.",
     )
     deduplicate.add_argument(
         "--hash-batch-size",
@@ -220,6 +231,21 @@ def build_parser() -> argparse.ArgumentParser:
     scan_licenses.add_argument("input_directory", type=Path)
     scan_licenses.add_argument("--output-directory", type=Path)
     scan_licenses.add_argument("--scancode", default="scancode")
+    scan_licenses.add_argument(
+        "--scanner-backend",
+        choices=["cli", "api"],
+        default="cli",
+        help="Use the ScanCode CLI or the in-process ScanCode Python API.",
+    )
+    scan_licenses.add_argument(
+        "--scancode-processes",
+        type=int,
+        default=1,
+        help=(
+            "Parallel processes used inside each ScanCode invocation. "
+            "Use 1 with many --workers to avoid oversubscription; ScanCode accepts 0 and -1 for its special modes."
+        ),
+    )
     scan_licenses.add_argument("--batch-size", type=int, default=500)
     scan_licenses.add_argument(
         "--min-license-score",
@@ -238,6 +264,261 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Emit a license scan progress log every N records.",
+    )
+
+    scan_hf_licenses = subparsers.add_parser(
+        "scan-hf-comment-licenses",
+        help="Scan a Hugging Face-style Parquet comment dataset for license notices using ScanCode.",
+    )
+    scan_hf_licenses.add_argument("input_directory", type=Path)
+    scan_hf_licenses.add_argument("--output-directory", type=Path)
+    scan_hf_licenses.add_argument("--scancode", default="scancode")
+    scan_hf_licenses.add_argument(
+        "--scanner-backend",
+        choices=["api", "cli"],
+        default="api",
+        help="Use the in-process ScanCode Python API or the ScanCode CLI.",
+    )
+    scan_hf_licenses.add_argument(
+        "--detection-cache",
+        type=Path,
+        help="SQLite cache for exact opening-comment license detections. Defaults to the output directory.",
+    )
+    scan_hf_licenses.add_argument(
+        "--scancode-processes",
+        type=int,
+        default=1,
+        help=(
+            "Parallel processes used inside each ScanCode invocation. "
+            "Keep this low when using many shard workers; use 127 with --workers 1 to let ScanCode use all cores."
+        ),
+    )
+    scan_hf_licenses.add_argument("--batch-size", type=int, default=500)
+    scan_hf_licenses.add_argument("--workers", type=int, default=1)
+    scan_hf_licenses.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
+    scan_hf_licenses.add_argument("--languages", help="Comma-separated language directory names to include.")
+    scan_hf_licenses.add_argument("--max-shards", type=int)
+    scan_hf_licenses.add_argument(
+        "--min-license-score",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode score for a match to count as a license hit.",
+    )
+    scan_hf_licenses.add_argument(
+        "--min-match-coverage",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode match coverage for a match to count as a license hit.",
+    )
+    scan_hf_licenses.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="Emit a license scan progress log every N completed Parquet shards.",
+    )
+
+    prewarm_hf_license_cache = subparsers.add_parser(
+        "prewarm-hf-license-cache",
+        help="Scan Hugging Face-style Parquet comments into the ScanCode detection cache without writing output shards.",
+    )
+    prewarm_hf_license_cache.add_argument("input_directory", type=Path)
+    prewarm_hf_license_cache.add_argument(
+        "--detection-cache",
+        type=Path,
+        required=True,
+        help="SQLite cache for exact opening-comment license detections.",
+    )
+    prewarm_hf_license_cache.add_argument("--scancode", default="scancode")
+    prewarm_hf_license_cache.add_argument(
+        "--scanner-backend",
+        choices=["api", "cli"],
+        default="api",
+        help="Use the in-process ScanCode Python API or the ScanCode CLI.",
+    )
+    prewarm_hf_license_cache.add_argument(
+        "--scancode-processes",
+        type=int,
+        default=1,
+        help="Parallel processes used inside each ScanCode invocation.",
+    )
+    prewarm_hf_license_cache.add_argument("--batch-size", type=int, default=500)
+    prewarm_hf_license_cache.add_argument("--workers", type=int, default=1)
+    prewarm_hf_license_cache.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
+    prewarm_hf_license_cache.add_argument("--languages", help="Comma-separated language directory names to include.")
+    prewarm_hf_license_cache.add_argument("--max-shards", type=int)
+    prewarm_hf_license_cache.add_argument(
+        "--min-license-score",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode score for a match to count as a license hit.",
+    )
+    prewarm_hf_license_cache.add_argument(
+        "--min-match-coverage",
+        type=float,
+        default=95.0,
+        help="Minimum ScanCode match coverage for a match to count as a license hit.",
+    )
+    prewarm_hf_license_cache.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="Emit a cache prewarm progress log every N completed Parquet shards.",
+    )
+
+    score_histogram = subparsers.add_parser(
+        "license-score-histogram",
+        help="Print a terminal histogram of calculated ScanCode license scores.",
+    )
+    score_histogram.add_argument("input_directory", type=Path)
+    score_histogram.add_argument("--bins", type=int, default=20)
+    score_histogram.add_argument(
+        "--width",
+        type=int,
+        default=50,
+        help="Maximum bar width in terminal characters.",
+    )
+    score_histogram.add_argument(
+        "--lower-score",
+        type=float,
+        default=0.0,
+        help="Lower bound for the displayed score range.",
+    )
+    score_histogram.add_argument(
+        "--upper-score",
+        type=float,
+        default=100.0,
+        help="Upper bound for the displayed score range.",
+    )
+    score_histogram.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
+    score_histogram.add_argument("--languages", help="Comma-separated language directory names to include.")
+    score_histogram.add_argument("--max-shards", type=int)
+
+    topic_modelling = subparsers.add_parser(
+        "topic-model-low-scancode",
+        help="Run BERTopic over comments with ScanCode scores below a threshold.",
+    )
+    topic_modelling.add_argument("input_directory", type=Path)
+    topic_modelling.add_argument("--output-directory", type=Path)
+    topic_modelling.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.95,
+        help="Select comments with comment_license_score below this threshold. Use 0.95 or 95 for 95 percent.",
+    )
+    topic_modelling.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
+    topic_modelling.add_argument("--languages", help="Comma-separated language directory names to include.")
+    topic_modelling.add_argument("--max-shards", type=int)
+    topic_modelling.add_argument("--batch-size", type=int, default=8192)
+    topic_modelling.add_argument("--min-topic-size", type=int, default=10)
+    topic_modelling.add_argument(
+        "--calculate-probabilities",
+        action="store_true",
+        help="Ask BERTopic to calculate topic probabilities.",
+    )
+    topic_modelling.add_argument(
+        "--topic-sample-size",
+        type=int,
+        default=10,
+        help="Representative comments to keep per topic in topics.json.",
+    )
+    topic_modelling.add_argument(
+        "--save-model",
+        action="store_true",
+        help="Persist the fitted BERTopic model under the output directory.",
+    )
+    topic_modelling.add_argument(
+        "--judge-with-codex",
+        action="store_true",
+        help="Use `codex exec` as an LLM judge to validate discovered clusters.",
+    )
+    topic_modelling.add_argument("--codex-command", default="codex")
+    topic_modelling.add_argument("--codex-model")
+    topic_modelling.add_argument("--codex-timeout", type=int, default=600)
+    topic_modelling.add_argument(
+        "--judge-sample-size",
+        type=int,
+        default=8,
+        help="Representative comments per topic sent to the Codex judge.",
+    )
+    topic_modelling.add_argument(
+        "--judge-max-topics",
+        type=int,
+        help="Maximum non-outlier topics to submit to the Codex judge.",
+    )
+    topic_modelling.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete an existing output directory before writing topic modelling output.",
+    )
+
+    encoding_benchmark = subparsers.add_parser(
+        "benchmark-encoding-capacity",
+        help="Measure how many comment samples can be encoded by 2M-8B parameter models.",
+    )
+    encoding_benchmark.add_argument("input_directory", type=Path)
+    encoding_benchmark.add_argument("--output-directory", type=Path)
+    encoding_benchmark.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        help=(
+            "Model to benchmark, as MODEL_ID or MODEL_ID=PARAMETERS. "
+            "Parameters accept suffixes such as 22M or 0.6B; values must be within 2M-8B. "
+            "Can be repeated."
+        ),
+    )
+    encoding_benchmark.add_argument(
+        "--model-config",
+        type=Path,
+        help="JSON list, or object with a models list, containing model_id and optional parameters/revision.",
+    )
+    encoding_benchmark.add_argument(
+        "--text-field",
+        default="opening_comment",
+        help="Input text column or JSON field to encode.",
+    )
+    encoding_benchmark.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
+    encoding_benchmark.add_argument("--languages", help="Comma-separated language directory names to include.")
+    encoding_benchmark.add_argument("--max-shards", type=int)
+    encoding_benchmark.add_argument(
+        "--max-samples",
+        type=int,
+        default=10_000,
+        help="Maximum matching comments to load before benchmarking. Ignored with --all-samples.",
+    )
+    encoding_benchmark.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="Load every matching comment instead of applying --max-samples.",
+    )
+    encoding_benchmark.add_argument(
+        "--sample-counts",
+        help="Comma-separated exact sample counts to try. Defaults to geometric growth up to loaded samples.",
+    )
+    encoding_benchmark.add_argument("--initial-samples", type=int, default=128)
+    encoding_benchmark.add_argument("--sample-growth", type=float, default=2.0)
+    encoding_benchmark.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="SentenceTransformer encode batch size used inside each sample-count trial.",
+    )
+    encoding_benchmark.add_argument("--device", help="Torch device passed to SentenceTransformer, such as cuda or cpu.")
+    encoding_benchmark.add_argument("--cache-folder", type=Path)
+    encoding_benchmark.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow Hugging Face models that require remote code execution.",
+    )
+    encoding_benchmark.add_argument(
+        "--normalize-embeddings",
+        action="store_true",
+        help="Ask SentenceTransformer.encode to normalize embeddings.",
+    )
+    encoding_benchmark.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete an existing output directory before writing benchmark output.",
     )
 
     mine_config = subparsers.add_parser(
@@ -286,6 +567,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["thread", "process"],
         help="Run package workers as threads or separate processes.",
     )
+    stack_v2_packages.add_argument(
+        "--package-worker-max-tasks-per-child",
+        type=int,
+        help=(
+            "Recycle process package workers after this many packages. "
+            "Use 0 to disable recycling. Defaults to 1 for process workers."
+        ),
+    )
     stack_v2_packages.add_argument("--content-download-workers", type=int, default=2048)
     stack_v2_packages.add_argument("--content-prefetch-records", type=int)
     stack_v2_packages.add_argument("--extraction-workers", type=int, default=_DEFAULT_EXTRACTION_WORKERS)
@@ -326,6 +615,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip duplicate dataset+record_id rows while exporting.",
     )
     export_hf.add_argument(
+        "--dedupe-scope",
+        choices=["global", "input-group"],
+        default="global",
+        help=(
+            "Scope for --dedupe-record-ids. 'input-group' resets the dedupe set "
+            "for each mined top-level output directory."
+        ),
+    )
+    export_hf.add_argument(
+        "--dataset-card-layout",
+        choices=["dataset-language-configs", "language-splits"],
+        default="dataset-language-configs",
+        help=(
+            "README config layout. 'language-splits' matches the published "
+            "code-comments layout with one config per source dataset."
+        ),
+    )
+    export_hf.add_argument(
         "--format",
         choices=["parquet", "jsonl"],
         default="parquet",
@@ -339,6 +646,12 @@ def build_parser() -> argparse.ArgumentParser:
     export_hf.add_argument("--max-records-per-shard", type=int)
     export_hf.add_argument("--max-bytes-per-shard", type=int)
     export_hf.add_argument("--max-open-writers", type=int, default=64)
+    export_hf.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel export worker processes. Use with --dedupe-scope input-group for package outputs.",
+    )
 
     return parser
 
@@ -623,6 +936,8 @@ def _scan_comment_licenses(
     *,
     output_directory: Path | None,
     scancode: str,
+    scanner_backend: str,
+    scancode_processes: int,
     batch_size: int,
     min_license_score: float,
     min_match_coverage: float,
@@ -632,6 +947,8 @@ def _scan_comment_licenses(
         input_directory,
         output_directory=output_directory,
         scancode_command=scancode,
+        scanner_backend=scanner_backend,
+        scancode_processes=scancode_processes,
         batch_size=batch_size,
         min_license_score=min_license_score,
         min_match_coverage=min_match_coverage,
@@ -645,6 +962,242 @@ def _scan_comment_licenses(
     print(f"Shards processed: {stats.shards_processed}")
     print(f"Shards skipped: {stats.shards_skipped}")
     print(f"Batches run: {stats.batches_run}")
+    return 0
+
+
+def _scan_hf_comment_licenses(
+    input_directory: Path,
+    *,
+    output_directory: Path | None,
+    scancode: str,
+    scanner_backend: str,
+    scancode_processes: int,
+    detection_cache: Path | None,
+    batch_size: int,
+    workers: int,
+    dataset_names: list[str] | None,
+    languages: list[str] | None,
+    max_shards: int | None,
+    min_license_score: float,
+    min_match_coverage: float,
+    progress_every: int,
+) -> int:
+    stats = scan_huggingface_comment_licenses(
+        input_directory,
+        output_directory=output_directory,
+        scancode_command=scancode,
+        scanner_backend=scanner_backend,
+        scancode_processes=scancode_processes,
+        detection_cache_path=detection_cache,
+        batch_size=batch_size,
+        workers=workers,
+        dataset_names=dataset_names,
+        languages=languages,
+        max_shards=max_shards,
+        min_license_score=min_license_score,
+        min_match_coverage=min_match_coverage,
+        progress_every=progress_every,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Records scanned: {stats.records_scanned}")
+    print(f"Records with detected license: {stats.records_with_detected_license}")
+    print(f"Records without detected license: {stats.records_without_detected_license}")
+    print(f"Shards processed: {stats.shards_processed}")
+    print(f"Shards skipped: {stats.shards_skipped}")
+    print(f"Batches run: {stats.batches_run}")
+    return 0
+
+
+def _prewarm_hf_license_cache(
+    input_directory: Path,
+    *,
+    scancode: str,
+    scanner_backend: str,
+    scancode_processes: int,
+    detection_cache: Path,
+    batch_size: int,
+    workers: int,
+    dataset_names: list[str] | None,
+    languages: list[str] | None,
+    max_shards: int | None,
+    min_license_score: float,
+    min_match_coverage: float,
+    progress_every: int,
+) -> int:
+    stats = prewarm_huggingface_license_detection_cache(
+        input_directory,
+        detection_cache_path=detection_cache,
+        scancode_command=scancode,
+        scanner_backend=scanner_backend,
+        scancode_processes=scancode_processes,
+        batch_size=batch_size,
+        workers=workers,
+        dataset_names=dataset_names,
+        languages=languages,
+        max_shards=max_shards,
+        min_license_score=min_license_score,
+        min_match_coverage=min_match_coverage,
+        progress_every=progress_every,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Detection cache: {stats.detection_cache_path}")
+    print(f"Records seen: {stats.records_seen}")
+    print(f"Unique comments seen: {stats.unique_comments_seen}")
+    print(f"Cached comments: {stats.cached_comments}")
+    print(f"Comments scanned: {stats.comments_scanned}")
+    print(
+        "Unique comments with detected license: "
+        f"{stats.unique_comments_with_detected_license}"
+    )
+    print(f"Shards processed: {stats.shards_processed}")
+    print(f"Batches run: {stats.batches_run}")
+    return 0
+
+
+def _license_score_histogram(
+    input_directory: Path,
+    *,
+    bins: int,
+    width: int,
+    lower_score: float,
+    upper_score: float,
+    dataset_names: list[str] | None,
+    languages: list[str] | None,
+    max_shards: int | None,
+) -> int:
+    histogram = build_license_score_histogram(
+        input_directory,
+        bins=bins,
+        lower_score=lower_score,
+        upper_score=upper_score,
+        dataset_names=dataset_names,
+        languages=languages,
+        max_shards=max_shards,
+    )
+    print(format_license_score_histogram(histogram, width=width))
+    return 0
+
+
+def _topic_model_low_scancode(
+    input_directory: Path,
+    *,
+    output_directory: Path | None,
+    score_threshold: float,
+    dataset_names: list[str] | None,
+    languages: list[str] | None,
+    max_shards: int | None,
+    batch_size: int,
+    min_topic_size: int,
+    calculate_probabilities: bool,
+    topic_sample_size: int,
+    save_model: bool,
+    judge_with_codex: bool,
+    codex_command: str,
+    codex_model: str | None,
+    codex_timeout: int,
+    judge_sample_size: int,
+    judge_max_topics: int | None,
+    overwrite: bool,
+) -> int:
+    stats = run_low_scancode_topic_modelling(
+        input_directory,
+        output_directory=output_directory,
+        score_threshold=score_threshold,
+        dataset_names=dataset_names,
+        languages=languages,
+        max_shards=max_shards,
+        batch_size=batch_size,
+        min_topic_size=min_topic_size,
+        calculate_probabilities=calculate_probabilities,
+        topic_sample_size=topic_sample_size,
+        save_model=save_model,
+        judge_with_codex=judge_with_codex,
+        codex_command=codex_command,
+        codex_model=codex_model,
+        codex_timeout=codex_timeout,
+        judge_sample_size=judge_sample_size,
+        judge_max_topics=judge_max_topics,
+        overwrite=overwrite,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Input format: {stats.input_format}")
+    print(f"Score threshold: {stats.score_threshold} ({stats.normalized_score_threshold} on 0-100 scale)")
+    print(f"Records seen: {stats.records_seen}")
+    print(f"Records selected: {stats.records_selected}")
+    print(f"Records modelled: {stats.records_modelled}")
+    print(f"Topics discovered: {stats.topics_discovered}")
+    print(f"Outlier records: {stats.outlier_records}")
+    print(f"Assignments: {stats.assignments_path}")
+    print(f"Topics: {stats.topics_path}")
+    print(f"Manifest: {stats.manifest_path}")
+    if stats.model_path is not None:
+        print(f"BERTopic model: {stats.model_path}")
+    if stats.codex_judge_report_path is not None:
+        print(f"Codex judge report: {stats.codex_judge_report_path}")
+    return 0
+
+
+def _benchmark_encoding_capacity(
+    input_directory: Path,
+    *,
+    output_directory: Path | None,
+    model_values: list[str],
+    model_config: Path | None,
+    text_field: str,
+    dataset_names: list[str] | None,
+    languages: list[str] | None,
+    max_shards: int | None,
+    max_samples: int | None,
+    sample_counts: list[int] | None,
+    initial_samples: int,
+    sample_growth: float,
+    batch_size: int,
+    device: str | None,
+    cache_folder: Path | None,
+    trust_remote_code: bool,
+    normalize_embeddings: bool,
+    overwrite: bool,
+) -> int:
+    model_specs = load_encoding_model_specs(model_values, model_config=model_config)
+    stats = run_encoding_capacity_benchmark(
+        input_directory,
+        model_specs,
+        output_directory=output_directory,
+        text_field=text_field,
+        dataset_names=dataset_names,
+        languages=languages,
+        max_shards=max_shards,
+        max_samples=max_samples,
+        sample_counts=sample_counts,
+        initial_samples=initial_samples,
+        sample_growth=sample_growth,
+        batch_size=batch_size,
+        device=device,
+        cache_folder=cache_folder,
+        trust_remote_code=trust_remote_code,
+        normalize_embeddings=normalize_embeddings,
+        overwrite=overwrite,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Input format: {stats.input_format}")
+    print(f"Text field: {stats.text_field}")
+    print(f"Records seen: {stats.records_seen}")
+    print(f"Samples loaded: {stats.samples_loaded}")
+    print(f"Models benchmarked: {stats.models_benchmarked}")
+    print(f"Report: {stats.report_path}")
+    print(f"Summary CSV: {stats.summary_path}")
+    if stats.report_path is not None and stats.report_path.exists():
+        report = json.loads(stats.report_path.read_text(encoding="utf-8"))
+        print("Largest successful sample counts:")
+        for model in report.get("models", []):
+            if model.get("load_error"):
+                error = model["load_error"]
+                print(f"- {model.get('model_id')}: failed to load ({error.get('type')}: {error.get('message')})")
+            else:
+                print(f"- {model.get('model_id')}: {model.get('largest_successful_sample_count')}")
     return 0
 
 
@@ -710,6 +1263,12 @@ def _split_csv(value: str | None) -> list[str] | None:
     if value is None:
         return None
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _split_int_csv(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def _mine_config(
@@ -834,6 +1393,7 @@ def _mine_stack_v2_packages_command(
     metadata_download_workers: int,
     package_workers: int,
     package_worker_backend: str | None,
+    package_worker_max_tasks_per_child: int | None,
     content_download_workers: int,
     content_prefetch_records: int | None,
     extraction_workers: int,
@@ -859,6 +1419,7 @@ def _mine_stack_v2_packages_command(
         metadata_download_workers=metadata_download_workers,
         package_workers=package_workers,
         package_worker_backend=package_worker_backend,
+        package_worker_max_tasks_per_child=package_worker_max_tasks_per_child,
         content_download_workers=content_download_workers,
         content_prefetch_records=content_prefetch_records,
         extraction_workers=extraction_workers,
@@ -891,11 +1452,14 @@ def _export_hf_dataset(
     *,
     input_directory: Path | None,
     dedupe_record_ids: bool,
+    dedupe_scope: str,
+    dataset_card_layout: str,
     output_format: str,
     overwrite: bool,
     max_records_per_shard: int | None,
     max_bytes_per_shard: int | None,
     max_open_writers: int,
+    workers: int,
 ) -> int:
     config = PipelineConfig.from_path(config_path)
     source_directory = input_directory or config.storage.output_directory
@@ -912,13 +1476,19 @@ def _export_hf_dataset(
         max_records_per_shard=max_records_per_shard or config.storage.max_records_per_shard,
         max_bytes_per_shard=max_bytes_per_shard or config.storage.max_bytes_per_shard,
         dedupe_record_ids=dedupe_record_ids,
+        dedupe_scope=dedupe_scope,
+        dataset_card_layout=dataset_card_layout,
         max_open_writers=max_open_writers,
+        workers=workers,
     )
     print(f"Input directory: {source_directory}")
     print(f"Output directory: {stats.output_directory}")
     print(f"Format: {output_format}")
     print(f"Records written: {stats.records_written}")
     print(f"Duplicates skipped: {stats.records_skipped_duplicate}")
+    print(f"Dedupe scope: {dedupe_scope if dedupe_record_ids else 'none'}")
+    print(f"Dataset card layout: {dataset_card_layout}")
+    print(f"Workers: {workers}")
     print(f"Groups: {len(stats.groups)}")
     for group in sorted(stats.groups.values(), key=lambda item: (item.dataset, item.language)):
         print(f"- {group.dataset} / {group.language}: {group.records} records")
@@ -1003,10 +1573,98 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.input_directory,
                 output_directory=args.output_directory,
                 scancode=args.scancode,
+                scanner_backend=args.scanner_backend,
+                scancode_processes=args.scancode_processes,
                 batch_size=args.batch_size,
                 min_license_score=args.min_license_score,
                 min_match_coverage=args.min_match_coverage,
                 progress_every=args.progress_every,
+            )
+        if args.command == "scan-hf-comment-licenses":
+            return _scan_hf_comment_licenses(
+                args.input_directory,
+                output_directory=args.output_directory,
+                scancode=args.scancode,
+                scanner_backend=args.scanner_backend,
+                scancode_processes=args.scancode_processes,
+                detection_cache=args.detection_cache,
+                batch_size=args.batch_size,
+                workers=args.workers,
+                dataset_names=_split_csv(args.datasets),
+                languages=_split_csv(args.languages),
+                max_shards=args.max_shards,
+                min_license_score=args.min_license_score,
+                min_match_coverage=args.min_match_coverage,
+                progress_every=args.progress_every,
+            )
+        if args.command == "prewarm-hf-license-cache":
+            return _prewarm_hf_license_cache(
+                args.input_directory,
+                scancode=args.scancode,
+                scanner_backend=args.scanner_backend,
+                scancode_processes=args.scancode_processes,
+                detection_cache=args.detection_cache,
+                batch_size=args.batch_size,
+                workers=args.workers,
+                dataset_names=_split_csv(args.datasets),
+                languages=_split_csv(args.languages),
+                max_shards=args.max_shards,
+                min_license_score=args.min_license_score,
+                min_match_coverage=args.min_match_coverage,
+                progress_every=args.progress_every,
+            )
+        if args.command == "license-score-histogram":
+            return _license_score_histogram(
+                args.input_directory,
+                bins=args.bins,
+                width=args.width,
+                lower_score=args.lower_score,
+                upper_score=args.upper_score,
+                dataset_names=_split_csv(args.datasets),
+                languages=_split_csv(args.languages),
+                max_shards=args.max_shards,
+            )
+        if args.command == "topic-model-low-scancode":
+            return _topic_model_low_scancode(
+                args.input_directory,
+                output_directory=args.output_directory,
+                score_threshold=args.score_threshold,
+                dataset_names=_split_csv(args.datasets),
+                languages=_split_csv(args.languages),
+                max_shards=args.max_shards,
+                batch_size=args.batch_size,
+                min_topic_size=args.min_topic_size,
+                calculate_probabilities=args.calculate_probabilities,
+                topic_sample_size=args.topic_sample_size,
+                save_model=args.save_model,
+                judge_with_codex=args.judge_with_codex,
+                codex_command=args.codex_command,
+                codex_model=args.codex_model,
+                codex_timeout=args.codex_timeout,
+                judge_sample_size=args.judge_sample_size,
+                judge_max_topics=args.judge_max_topics,
+                overwrite=args.overwrite,
+            )
+        if args.command == "benchmark-encoding-capacity":
+            return _benchmark_encoding_capacity(
+                args.input_directory,
+                output_directory=args.output_directory,
+                model_values=args.model,
+                model_config=args.model_config,
+                text_field=args.text_field,
+                dataset_names=_split_csv(args.datasets),
+                languages=_split_csv(args.languages),
+                max_shards=args.max_shards,
+                max_samples=None if args.all_samples else args.max_samples,
+                sample_counts=_split_int_csv(args.sample_counts),
+                initial_samples=args.initial_samples,
+                sample_growth=args.sample_growth,
+                batch_size=args.batch_size,
+                device=args.device,
+                cache_folder=args.cache_folder,
+                trust_remote_code=args.trust_remote_code,
+                normalize_embeddings=args.normalize_embeddings,
+                overwrite=args.overwrite,
             )
         if args.command == "mine-config":
             return _mine_config(
@@ -1042,6 +1700,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 metadata_download_workers=args.metadata_download_workers,
                 package_workers=args.package_workers,
                 package_worker_backend=args.package_worker_backend,
+                package_worker_max_tasks_per_child=args.package_worker_max_tasks_per_child,
                 content_download_workers=args.content_download_workers,
                 content_prefetch_records=args.content_prefetch_records,
                 extraction_workers=args.extraction_workers,
@@ -1059,11 +1718,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output_directory,
                 input_directory=args.input_directory,
                 dedupe_record_ids=args.dedupe_record_ids,
+                dedupe_scope=args.dedupe_scope,
+                dataset_card_layout=args.dataset_card_layout,
                 output_format=args.format,
                 overwrite=args.overwrite,
                 max_records_per_shard=args.max_records_per_shard,
                 max_bytes_per_shard=args.max_bytes_per_shard,
                 max_open_writers=args.max_open_writers,
+                workers=args.workers,
             )
     except (KeyError, ValueError) as exc:
         parser.exit(status=2, message=f"{exc}\n")

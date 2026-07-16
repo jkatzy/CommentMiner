@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,6 +17,8 @@ from commentminer.stackv2_packages import (
     StackV2IdPackage,
     StackV2IdSegment,
     StackV2SWHContentPackageSource,
+    _package_worker_max_tasks_per_child_option,
+    _run_packages,
     mine_stack_v2_id_packages,
     plan_stack_v2_id_packages,
 )
@@ -134,6 +137,72 @@ def _copy_by_remote(fixtures: dict[str, Path]):
 
 
 class StackV2PackageTests(unittest.TestCase):
+    def test_package_worker_max_tasks_option_defaults_and_validates(self) -> None:
+        self.assertEqual(
+            _package_worker_max_tasks_per_child_option(None, default=1),
+            1,
+        )
+        self.assertEqual(
+            _package_worker_max_tasks_per_child_option("3", default=1),
+            3,
+        )
+        self.assertIsNone(
+            _package_worker_max_tasks_per_child_option(0, default=1),
+        )
+        self.assertIsNone(
+            _package_worker_max_tasks_per_child_option(None, default=None),
+        )
+        with self.assertRaises(ValueError):
+            _package_worker_max_tasks_per_child_option(-1, default=1)
+
+    def test_process_package_workers_pass_max_tasks_per_child_to_executor(self) -> None:
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        class RecordingProcessPoolExecutor:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                calls.append((args, kwargs))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = _build_config(root)
+            dataset = _build_dataset()
+            downloader = HuggingFaceDownloader(api=FakeApi([]))
+
+            with patch(
+                "commentminer.stackv2_packages.ProcessPoolExecutor",
+                RecordingProcessPoolExecutor,
+            ):
+                _run_packages(
+                    config,
+                    dataset,
+                    [],
+                    downloader=downloader,
+                    token=None,
+                    package_workers=1,
+                    package_worker_backend="process",
+                    package_worker_max_tasks_per_child=7,
+                    content_download_workers=1,
+                    content_prefetch_records=1,
+                    content_fetcher=None,
+                    content_executor=None,
+                    content_language_filter=None,
+                    extractor_factory=FirstLineExtractor,
+                    extraction_workers=1,
+                    extraction_buffer=None,
+                    cache_source_files=False,
+                    show_progress=False,
+                    progress_every=0,
+                    skip_errors=False,
+                )
+
+        self.assertEqual(calls, [((), {"max_workers": 1, "max_tasks_per_child": 7})])
+
     def test_plan_splits_id_packages_across_language_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
