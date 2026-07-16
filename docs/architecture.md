@@ -7,20 +7,22 @@
 - Make long runs restartable and easy to inspect.
 - Normalize outputs from different datasets into one shared schema.
 
-## Proposed Pipeline
+## Pipeline
 
 1. Source adapter
    Reads one upstream dataset and yields normalized input records.
 2. Extraction step
-   Passes normalized records through a bounded worker pool backed by the `ml4se-tk` opening-comment extractor.
+   Passes normalized records through a bounded worker pool backed by the `ml4setk` opening-comment extractor.
 3. Normalization step
    Converts extracted comments into a canonical output row.
 4. Shard writer
-   Writes JSONL shards with bounded size and per-run manifests.
+   Atomically finalizes canonical Parquet shards with bounded size and per-run manifests.
 5. Checkpoint store
-   Saves resume information after a configurable number of records.
-6. Merge step
-   Combines shard outputs from multiple sources into one final dataset view.
+   Saves resume information after the corresponding Parquet rows are durable.
+6. Hugging Face materialization
+   Regroups mined Parquet runs by dataset and language and optionally deduplicates record IDs.
+7. ScanCode scoring
+   Mirrors the Hugging Face Parquet tree and appends license detection and score columns.
 
 ## Canonical Output Fields
 
@@ -45,14 +47,14 @@
 
 - Normalize every dataset to the same row schema first.
 - Preserve provenance so merged rows can always be traced back to a source.
-- Add deduplication only after the baseline pipeline is stable.
-- Keep merging separate from source extraction so reprocessing one dataset does not invalidate the rest.
+- Keep materialization separate from source extraction so reprocessing one dataset does not invalidate the rest.
+- Deduplicate stable `dataset` plus `record_id` keys during materialization when reruns overlap.
 
-## First Implementation Targets
+## Format Decisions
 
-- Add dataset adapters for the first one or two corpora.
-- Add an integration wrapper for `ml4se-tk`.
-- Decide whether final materialization should be JSONL-only or Arrow/Parquet as well.
+- All source configurations use Hugging Face dataset repositories.
+- Source shards, mined runs, materialized datasets, scored datasets, topic assignments, and analysis inputs use Parquet.
+- JSON files are limited to configuration, checkpoints, manifests, and structured reports. Heterogeneous metadata and ScanCode detections are serialized strings inside typed Parquet columns.
 
 ## Download Baseline
 
@@ -68,4 +70,5 @@ The first downloader implementation targets Hugging Face dataset repos:
 
 - Parquet sources keep a bounded window of remote shards downloaded or in flight.
 - The mining pipeline keeps a bounded queue of records submitted to comment extraction workers.
-- Checkpoints and output writes are still applied in source order, so resumability does not depend on worker completion order.
+- Results remain in source order even when extraction is concurrent.
+- An active Parquet shard is atomically finalized before its source checkpoint advances.

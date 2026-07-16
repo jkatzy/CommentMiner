@@ -84,7 +84,7 @@ class StorageConfig:
 class DatasetSpec:
     name: str
     input_uri: str | None = None
-    source: str = "custom"
+    source: str = "huggingface_hub"
     repo_id: str | None = None
     repo_type: str = "dataset"
     revision: str = "main"
@@ -104,7 +104,7 @@ class DatasetSpec:
         return cls(
             name=str(data["name"]),
             input_uri=str(data["input_uri"]) if data.get("input_uri") is not None else None,
-            source=str(data.get("source", "custom")),
+            source=str(data.get("source", "huggingface_hub")),
             repo_id=str(data["repo_id"]) if data.get("repo_id") is not None else None,
             repo_type=str(data.get("repo_type", "dataset")),
             revision=str(data.get("revision", "main")),
@@ -227,6 +227,15 @@ class PipelineConfig:
         base_dir: Path,
     ) -> "PipelineConfig":
         datasets = [DatasetSpec.from_dict(item) for item in data.get("datasets", [])]
+        unsupported_sources = sorted(
+            {dataset.source for dataset in datasets if dataset.source != "huggingface_hub"}
+        )
+        if unsupported_sources:
+            joined = ", ".join(unsupported_sources)
+            raise ValueError(
+                "CommentMiner supports Hugging Face dataset sources only; "
+                f"unsupported source values: {joined}"
+            )
         checkpoint_interval_records = _require_positive_int(
             "checkpoint_interval_records",
             int(data.get("checkpoint_interval_records", 1_000)),

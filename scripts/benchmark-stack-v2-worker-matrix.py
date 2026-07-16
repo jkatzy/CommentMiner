@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
-import tempfile
 import time
 from typing import Sequence
 
@@ -204,11 +203,7 @@ def main() -> int:
     )
 
     results_path = root / "results.csv"
-    results_jsonl_path = root / "results.jsonl"
-    with results_path.open("w", newline="", encoding="utf-8") as csv_handle, results_jsonl_path.open(
-        "w",
-        encoding="utf-8",
-    ) as jsonl_handle:
+    with results_path.open("w", newline="", encoding="utf-8") as csv_handle:
         writer = csv.DictWriter(csv_handle, fieldnames=list(MatrixResult.__dataclass_fields__))
         writer.writeheader()
         for package_workers, content_workers in combos:
@@ -239,8 +234,6 @@ def main() -> int:
             )
             writer.writerow(asdict(result))
             csv_handle.flush()
-            jsonl_handle.write(json.dumps(asdict(result), separators=(",", ":")) + "\n")
-            jsonl_handle.flush()
             print(
                 "RESULT",
                 f"package_workers={result.package_workers}",

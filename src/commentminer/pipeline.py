@@ -6,12 +6,13 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator
 
 from .config import PipelineConfig
 from .models import CommentExtractor, CommentRecord, DatasetSource, ExtractedComment, InputRecord
+from .parquet_io import estimated_record_bytes, normalize_comment_record, write_comment_records
 
 
 _SLUG_PATTERN = re.compile(r"[^a-zA-Z0-9]+")
@@ -33,22 +34,6 @@ def _normalize_comment(comment: str | None) -> str | None:
         return None
     normalized = comment.replace("\r\n", "\n").strip()
     return normalized or None
-
-
-def _json_default(value: object) -> object:
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    if isinstance(value, set):
-        return list(value)
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except (TypeError, ValueError):
-            pass
-    return str(value)
 
 
 def _comment_record_payload(record: CommentRecord) -> dict[str, object]:
@@ -126,7 +111,7 @@ class CheckpointStore:
         return path
 
 
-class JsonlShardWriter:
+class ParquetShardWriter:
     def __init__(
         self,
         root: Path,
@@ -140,59 +125,56 @@ class JsonlShardWriter:
         self.dataset_name = dataset_name
         self.dataset_directory = root / _slugify(dataset_name) / self.run_id
         self.dataset_directory.mkdir(parents=True, exist_ok=True)
+        for temporary_path in self.dataset_directory.glob(".*.tmp.*"):
+            temporary_path.unlink(missing_ok=True)
         self.max_records_per_shard = max_records_per_shard
         self.max_bytes_per_shard = max_bytes_per_shard
-        self._handle = None
+        self._buffered_records: list[dict[str, object]] = []
+        self._current_shard_path: Path | None = None
+        self._dirty = False
         self._current_bytes = 0
         self._current_records = 0
         self._next_shard_index = 0
         self.shard_paths: list[Path] = []
 
     def _open_next_shard(self) -> None:
-        self.close()
-        shard_path = self.dataset_directory / f"part-{self._next_shard_index:05d}.jsonl"
+        self.flush()
+        self._buffered_records = []
+        shard_path = self.dataset_directory / f"part-{self._next_shard_index:05d}.parquet"
         self._next_shard_index += 1
-        self._handle = shard_path.open("a", encoding="utf-8")
+        self._current_shard_path = shard_path
         self._current_bytes = 0
         self._current_records = 0
         self.shard_paths.append(shard_path)
 
     def write(self, record: CommentRecord) -> None:
-        line = (
-            json.dumps(
-                _comment_record_payload(record),
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=_json_default,
-            )
-            + "\n"
-        )
-        self.write_json_line(line)
+        payload = normalize_comment_record(_comment_record_payload(record))
+        encoded_bytes = estimated_record_bytes(payload)
 
-    def write_json_line(self, line: str) -> None:
-        encoded = line.encode("utf-8")
-
-        if self._handle is None:
+        if self._current_shard_path is None:
             self._open_next_shard()
         elif (
             self._current_records >= self.max_records_per_shard
-            or self._current_bytes + len(encoded) > self.max_bytes_per_shard
+            or self._current_bytes + encoded_bytes > self.max_bytes_per_shard
         ):
             self._open_next_shard()
 
-        assert self._handle is not None
-        self._handle.write(line)
+        self._buffered_records.append(payload)
+        self._dirty = True
         self._current_records += 1
-        self._current_bytes += len(encoded)
+        self._current_bytes += encoded_bytes
 
     def flush(self) -> None:
-        if self._handle is not None:
-            self._handle.flush()
+        if not self._dirty:
+            return
+        assert self._current_shard_path is not None
+        write_comment_records(self._current_shard_path, self._buffered_records)
+        self._dirty = False
 
     def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
+        self.flush()
+        self._buffered_records = []
+        self._current_shard_path = None
 
 
 def _normalize_extracted_comments(value: object) -> list[ExtractedComment]:
@@ -339,7 +321,7 @@ def _build_comment_record(
 
 
 def _write_run_manifest(
-    writer: JsonlShardWriter,
+    writer: ParquetShardWriter,
     stats: PipelineRunStats,
     checkpoint: DatasetCheckpoint,
     checkpoint_path: Path,
@@ -381,7 +363,7 @@ def run_dataset(
 
     checkpoint_store = CheckpointStore(config.storage.checkpoint_directory)
     checkpoint = checkpoint_store.load(source.name)
-    writer = JsonlShardWriter(
+    writer = ParquetShardWriter(
         config.storage.output_directory,
         source.name,
         max_records_per_shard=config.storage.max_records_per_shard,

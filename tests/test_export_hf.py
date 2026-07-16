@@ -8,13 +8,13 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from commentminer.export_hf import export_huggingface_dataset
+from commentminer.parquet_io import normalize_comment_record, write_comment_records
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
+def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
+    write_comment_records(
+        path,
+        [normalize_comment_record(row) for row in rows],
     )
 
 
@@ -24,8 +24,8 @@ class HuggingFaceExportTests(unittest.TestCase):
             root = Path(tmp_dir)
             mined = root / "output"
             destination = root / "comment-dataset"
-            _write_jsonl(
-                mined / "the-heap-antlr" / "20260620T000000Z" / "part-00000.jsonl",
+            _write_parquet(
+                mined / "the-heap-antlr" / "20260620T000000Z" / "part-00000.parquet",
                 [
                     {
                         "dataset": "the-heap",
@@ -47,12 +47,12 @@ class HuggingFaceExportTests(unittest.TestCase):
                     },
                 ],
             )
-            _write_jsonl(
-                mined / "redpajama-github-java" / "20260620T000000Z" / "part-00000.jsonl",
+            _write_parquet(
+                mined / "the-stack-java" / "20260620T000000Z" / "part-00000.parquet",
                 [
                     {
-                        "dataset": "redpajama-github",
-                        "record_id": "rp-1",
+                        "dataset": "the-stack",
+                        "record_id": "stack-1",
                         "opening_comment": "// header",
                         "language": "Java",
                         "path": "A.java",
@@ -65,7 +65,6 @@ class HuggingFaceExportTests(unittest.TestCase):
             stats = export_huggingface_dataset(
                 mined,
                 destination,
-                output_format="parquet",
                 max_records_per_shard=100,
                 max_bytes_per_shard=1024 * 1024,
                 dedupe_record_ids=True,
@@ -74,9 +73,9 @@ class HuggingFaceExportTests(unittest.TestCase):
             self.assertEqual(stats.records_written, 2)
             self.assertEqual(stats.records_skipped_duplicate, 1)
             heap_shard = destination / "the-heap" / "ANTLR" / "part-00000.parquet"
-            redpajama_shard = destination / "redpajama-github" / "Java" / "part-00000.parquet"
+            stack_shard = destination / "the-stack" / "Java" / "part-00000.parquet"
             self.assertTrue(heap_shard.exists())
-            self.assertTrue(redpajama_shard.exists())
+            self.assertTrue(stack_shard.exists())
 
             heap_rows = pq.read_table(heap_shard).to_pylist()
             self.assertEqual(len(heap_rows), 1)
@@ -95,8 +94,11 @@ class HuggingFaceExportTests(unittest.TestCase):
             root = Path(tmp_dir)
             mined = root / "output"
             destination = root / "comment-dataset"
-            _write_jsonl(
-                mined / "the-stack-v2-dedup-package-1" / "20260620T000000Z" / "part-00000.jsonl",
+            _write_parquet(
+                mined
+                / "the-stack-v2-dedup-package-1"
+                / "20260620T000000Z"
+                / "part-00000.parquet",
                 [
                     {
                         "dataset": "the-stack-v2-dedup",
@@ -122,7 +124,6 @@ class HuggingFaceExportTests(unittest.TestCase):
             export_huggingface_dataset(
                 mined,
                 destination,
-                output_format="parquet",
                 max_records_per_shard=100,
                 max_bytes_per_shard=1024 * 1024,
                 dataset_card_layout="language-splits",
@@ -150,19 +151,18 @@ class HuggingFaceExportTests(unittest.TestCase):
                 "repo": "owner/repo",
                 "metadata": {},
             }
-            _write_jsonl(
-                mined / "package-1" / "20260620T000000Z" / "part-00000.jsonl",
+            _write_parquet(
+                mined / "package-1" / "20260620T000000Z" / "part-00000.parquet",
                 [row, row],
             )
-            _write_jsonl(
-                mined / "package-2" / "20260620T000000Z" / "part-00000.jsonl",
+            _write_parquet(
+                mined / "package-2" / "20260620T000000Z" / "part-00000.parquet",
                 [row],
             )
 
             stats = export_huggingface_dataset(
                 mined,
                 destination,
-                output_format="parquet",
                 max_records_per_shard=100,
                 max_bytes_per_shard=1024 * 1024,
                 dedupe_record_ids=True,
@@ -180,8 +180,11 @@ class HuggingFaceExportTests(unittest.TestCase):
             mined = root / "output"
             destination = root / "comment-dataset"
             for index in range(4):
-                _write_jsonl(
-                    mined / f"package-{index}" / "20260620T000000Z" / "part-00000.jsonl",
+                _write_parquet(
+                    mined
+                    / f"package-{index}"
+                    / "20260620T000000Z"
+                    / "part-00000.parquet",
                     [
                         {
                             "dataset": "the-stack-v2-dedup",
@@ -198,7 +201,6 @@ class HuggingFaceExportTests(unittest.TestCase):
             stats = export_huggingface_dataset(
                 mined,
                 destination,
-                output_format="parquet",
                 max_records_per_shard=2,
                 max_bytes_per_shard=1024 * 1024,
                 dedupe_record_ids=True,

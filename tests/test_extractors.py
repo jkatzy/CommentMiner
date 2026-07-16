@@ -25,7 +25,7 @@ class ExtractorTests(unittest.TestCase):
     def test_ml4se_extractor_resolves_common_extension_alias(self) -> None:
         extractor = ML4SEOpeningCommentExtractor()
         record = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-ext",
             content="# header line\n\nprint('x')\n",
             metadata={"ext": "py"},
@@ -39,14 +39,14 @@ class ExtractorTests(unittest.TestCase):
     def test_ml4se_extractor_does_not_cache_unsupported_extension_as_record_failure(self) -> None:
         extractor = ML4SEOpeningCommentExtractor()
         first = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-header-1",
             content="/* header */\nint first;\n",
             language="c++",
             metadata={"ext": "h", "path_language": "c++"},
         )
         second = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-header-2",
             content="/* header */\nint second;\n",
             language="c++",
@@ -60,7 +60,7 @@ class ExtractorTests(unittest.TestCase):
     def test_ml4se_extractor_returns_comments_starting_within_first_ten_lines(self) -> None:
         extractor = ML4SEOpeningCommentExtractor(max_start_row=10)
         record = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-preproc",
             content=(
                 "#include <stdio.h>\n"
@@ -137,14 +137,14 @@ class ExtractorTests(unittest.TestCase):
     def test_ml4se_extractor_continues_after_cached_unsupported_candidate(self) -> None:
         extractor = ML4SEOpeningCommentExtractor()
         first = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-cache-1",
             content="/* header */\nint first;\n",
             language="c++",
             metadata={"selected_language": "not-a-language"},
         )
         second = InputRecord(
-            dataset="redpajama-github",
+            dataset="the-stack",
             record_id="r-cache-2",
             content="/* header */\nint second;\n",
             language="c++",

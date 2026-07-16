@@ -448,42 +448,19 @@ def _load_text_samples(
 ) -> _LoadedTextSamples:
     dataset_filter = set(dataset_names or [])
     language_filter = set(languages or [])
-    jsonl_shards = sorted(
-        set(input_directory.glob("part-*.jsonl"))
-        | set(input_directory.glob("*/*/part-*.jsonl"))
-    )
     parquet_shards = sorted(
         set(input_directory.glob("part-*.parquet"))
         | set(input_directory.glob("*/*/part-*.parquet"))
     )
     if max_shards is not None:
-        jsonl_shards = jsonl_shards[:max_shards]
         parquet_shards = parquet_shards[:max_shards]
-    if not jsonl_shards and not parquet_shards:
-        raise ValueError(f"No JSONL or Parquet comment shards found in: {input_directory}")
+    if not parquet_shards:
+        raise ValueError(f"No Parquet comment shards found in: {input_directory}")
 
     loaded = _LoadedTextSamples(
         texts=[],
-        input_format=(
-            "mixed"
-            if jsonl_shards and parquet_shards
-            else "jsonl"
-            if jsonl_shards
-            else "parquet"
-        ),
+        input_format="parquet",
     )
-    for shard in jsonl_shards:
-        _load_jsonl_texts(
-            shard,
-            loaded,
-            text_field=text_field,
-            dataset_filter=dataset_filter,
-            language_filter=language_filter,
-            max_samples=max_samples,
-        )
-        if max_samples is not None and len(loaded.texts) >= max_samples:
-            return loaded
-
     for shard in parquet_shards:
         _load_parquet_texts(
             shard,
@@ -496,33 +473,6 @@ def _load_text_samples(
         if max_samples is not None and len(loaded.texts) >= max_samples:
             return loaded
     return loaded
-
-
-def _load_jsonl_texts(
-    shard: Path,
-    loaded: _LoadedTextSamples,
-    *,
-    text_field: str,
-    dataset_filter: set[str],
-    language_filter: set[str],
-    max_samples: int | None,
-) -> None:
-    with shard.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            _maybe_add_text(
-                payload,
-                loaded,
-                text_field=text_field,
-                dataset_filter=dataset_filter,
-                language_filter=language_filter,
-                max_samples=max_samples,
-            )
-            if max_samples is not None and len(loaded.texts) >= max_samples:
-                break
-    loaded.shards_read += 1
 
 
 def _load_parquet_texts(

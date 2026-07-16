@@ -26,6 +26,7 @@ class PipelineConfigTests(unittest.TestCase):
                         "datasets": [
                             {
                                 "name": "toy",
+                                "source": "huggingface_hub",
                                 "input_uri": "memory://toy",
                             }
                         ],
@@ -42,6 +43,25 @@ class PipelineConfigTests(unittest.TestCase):
             self.assertEqual(config.storage.download_directory, (root / "var/downloads").resolve())
             self.assertEqual(config.storage.huggingface_cache_directory, (root / "var/hf-cache").resolve())
             self.assertEqual(config.datasets[0].name, "toy")
+
+    def test_rejects_non_huggingface_dataset_sources(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Hugging Face dataset sources only"):
+            PipelineConfig.from_dict(
+                {
+                    "storage": {
+                        "working_directory": "var/work",
+                        "output_directory": "var/output",
+                        "checkpoint_directory": "var/checkpoints",
+                    },
+                    "datasets": [
+                        {
+                            "name": "unsupported",
+                            "source": "local_files",
+                        }
+                    ],
+                },
+                base_dir=Path("/tmp/project"),
+            )
 
     def test_dataset_language_patterns_are_resolved(self) -> None:
         config = PipelineConfig.from_dict(

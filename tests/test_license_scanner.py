@@ -12,71 +12,9 @@ import pyarrow.parquet as pq
 from commentminer import license_scanner
 from commentminer.license_scanner import (
     build_license_score_histogram,
-    format_license_score_histogram,
     prewarm_huggingface_license_detection_cache,
-    scan_comment_licenses,
     scan_huggingface_comment_licenses,
 )
-
-
-def _write_input_run(root: Path) -> Path:
-    input_directory = root / "input-run"
-    input_directory.mkdir(parents=True, exist_ok=True)
-    (input_directory / "manifest.json").write_text(
-        json.dumps({"dataset": "the-stack", "run_id": "run-1"}, indent=2),
-        encoding="utf-8",
-    )
-    shard_one = input_directory / "part-00000.jsonl"
-    shard_one.write_text(
-        "\n".join(
-            [
-                json.dumps(
-                    {
-                        "dataset": "the-stack",
-                        "record_id": "1",
-                        "opening_comment": "Licensed under the Apache License, Version 2.0",
-                        "language": "python",
-                        "path": "a.py",
-                        "repo": "repo-a",
-                        "extracted_at": "2026-04-07T00:00:00+00:00",
-                        "metadata": {},
-                    }
-                ),
-                json.dumps(
-                    {
-                        "dataset": "the-stack",
-                        "record_id": "2",
-                        "opening_comment": "just a normal header",
-                        "language": "python",
-                        "path": "b.py",
-                        "repo": "repo-b",
-                        "extracted_at": "2026-04-07T00:00:00+00:00",
-                        "metadata": {},
-                    }
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shard_two = input_directory / "part-00001.jsonl"
-    shard_two.write_text(
-        json.dumps(
-            {
-                "dataset": "the-stack",
-                "record_id": "3",
-                "opening_comment": "SPDX-License-Identifier: MIT",
-                "language": "python",
-                "path": "c.py",
-                "repo": "repo-c",
-                "extracted_at": "2026-04-07T00:00:00+00:00",
-                "metadata": {},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return input_directory
 
 
 def _write_hf_dataset(root: Path) -> Path:
@@ -227,166 +165,6 @@ def _fake_scancode_runner(**kwargs):
 
 
 class LicenseScannerTests(unittest.TestCase):
-    def test_scan_comment_licenses_rejects_in_place_output_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            input_directory = _write_input_run(root)
-
-            with self.assertRaisesRegex(ValueError, "Output directory must differ"):
-                scan_comment_licenses(
-                    input_directory,
-                    output_directory=input_directory,
-                    runner=_fake_scancode_runner,
-                )
-
-    def test_scan_comment_licenses_writes_enriched_output_and_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            input_directory = _write_input_run(root)
-
-            stats = scan_comment_licenses(
-                input_directory,
-                runner=_fake_scancode_runner,
-                batch_size=2,
-            )
-
-            self.assertEqual(stats.records_scanned, 3)
-            self.assertEqual(stats.records_with_detected_license, 2)
-            self.assertEqual(stats.records_without_detected_license, 1)
-            self.assertEqual(stats.shards_processed, 2)
-            self.assertEqual(stats.shards_skipped, 0)
-
-            output_directory = input_directory.parent / f"{input_directory.name}-license-scan"
-            shard_one_payloads = [
-                json.loads(line)
-                for line in (output_directory / "part-00000.jsonl").read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(
-                shard_one_payloads[0]["comment_license_detection"]["detected_license_expression"],
-                "apache-2.0",
-            )
-            self.assertEqual(shard_one_payloads[0]["comment_license_score"], 97.0)
-            self.assertTrue(
-                shard_one_payloads[0]["comment_license_detection"]["contains_license_notice"]
-            )
-            self.assertIsNone(
-                shard_one_payloads[1]["comment_license_detection"]["detected_license_expression"]
-            )
-            self.assertEqual(shard_one_payloads[1]["comment_license_score"], 80.0)
-            self.assertFalse(
-                shard_one_payloads[1]["comment_license_detection"]["contains_license_notice"]
-            )
-            shard_two_payload = json.loads(
-                (output_directory / "part-00001.jsonl").read_text(encoding="utf-8").strip()
-            )
-            self.assertEqual(
-                shard_two_payload["comment_license_detection"]["detected_license_expression_spdx"],
-                "MIT",
-            )
-            self.assertEqual(shard_two_payload["comment_license_score"], 100.0)
-
-            manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["records_scanned"], 3)
-            self.assertEqual(manifest["records_with_detected_license"], 2)
-            self.assertEqual(manifest["min_license_score"], 95.0)
-            self.assertEqual(manifest["min_match_coverage"], 95.0)
-            self.assertEqual(manifest["source_manifest"]["dataset"], "the-stack")
-
-    def test_build_license_score_histogram_reads_jsonl_scan_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            input_directory = _write_input_run(root)
-
-            scan_comment_licenses(
-                input_directory,
-                runner=_fake_scancode_runner,
-                batch_size=2,
-            )
-
-            output_directory = input_directory.parent / f"{input_directory.name}-license-scan"
-            histogram = build_license_score_histogram(output_directory, bins=10)
-            self.assertEqual(histogram.shard_format, "jsonl")
-            self.assertEqual(histogram.shards_read, 2)
-            self.assertEqual(histogram.records_seen, 3)
-            self.assertEqual(histogram.scores_seen, 3)
-            self.assertEqual(histogram.bin_counts[8], 1)
-            self.assertEqual(histogram.bin_counts[9], 2)
-
-            rendered = format_license_score_histogram(histogram, width=12)
-            self.assertIn("ScanCode score histogram", rendered)
-            self.assertIn("Scores read: 3", rendered)
-
-    def test_scan_comment_licenses_resumes_completed_shards(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            input_directory = _write_input_run(root)
-            calls: list[list[str]] = []
-
-            def _counting_runner(**kwargs):
-                inputs_dir = Path(kwargs["inputs_dir"])
-                calls.append(sorted(path.name for path in inputs_dir.glob("*.txt")))
-                return _fake_scancode_runner(**kwargs)
-
-            first_stats = scan_comment_licenses(
-                input_directory,
-                runner=_counting_runner,
-                batch_size=10,
-            )
-            second_stats = scan_comment_licenses(
-                input_directory,
-                runner=_counting_runner,
-                batch_size=10,
-            )
-
-            self.assertEqual(first_stats.shards_processed, 2)
-            self.assertEqual(second_stats.shards_processed, 0)
-            self.assertEqual(second_stats.shards_skipped, 2)
-            self.assertEqual(second_stats.records_scanned, 3)
-            self.assertEqual(second_stats.records_with_detected_license, 2)
-            self.assertEqual(len(calls), 2)
-            output_directory = input_directory.parent / f"{input_directory.name}-license-scan"
-            manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["records_scanned"], 3)
-            self.assertEqual(manifest["records_with_detected_license"], 2)
-
-            (output_directory / "part-00000.jsonl").unlink()
-            restored_stats = scan_comment_licenses(
-                input_directory,
-                runner=_counting_runner,
-                batch_size=10,
-            )
-            self.assertEqual(restored_stats.shards_processed, 1)
-            self.assertEqual(restored_stats.shards_skipped, 1)
-            self.assertEqual(restored_stats.records_scanned, 3)
-            self.assertTrue((output_directory / "part-00000.jsonl").exists())
-            self.assertEqual(len(calls), 3)
-
-    def test_scan_comment_licenses_rescans_when_thresholds_change(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            input_directory = _write_input_run(root)
-
-            scan_comment_licenses(
-                input_directory,
-                runner=_fake_scancode_runner,
-                batch_size=10,
-            )
-            rescanned = scan_comment_licenses(
-                input_directory,
-                runner=_fake_scancode_runner,
-                batch_size=10,
-                min_license_score=70,
-                min_match_coverage=80,
-            )
-
-            self.assertEqual(rescanned.shards_processed, 2)
-            self.assertEqual(rescanned.shards_skipped, 0)
-            self.assertEqual(rescanned.records_with_detected_license, 3)
-            output_directory = input_directory.parent / f"{input_directory.name}-license-scan"
-            manifest = json.loads((output_directory / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["scanner_backend"], "cli")
-            self.assertEqual(manifest["scan_configuration"]["min_license_score"], 70.0)
-
     def test_scan_huggingface_comment_licenses_writes_enriched_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -446,6 +224,10 @@ class LicenseScannerTests(unittest.TestCase):
             self.assertEqual(histogram.scores_seen, 2)
             self.assertEqual(histogram.bin_counts[8], 1)
             self.assertEqual(histogram.bin_counts[9], 1)
+
+            rendered = license_scanner.format_license_score_histogram(histogram, width=12)
+            self.assertIn("ScanCode score histogram", rendered)
+            self.assertIn("Scores read: 2", rendered)
 
     def test_scan_huggingface_comment_licenses_api_backend_uses_scancode_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

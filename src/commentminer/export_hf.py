@@ -10,10 +10,12 @@ from pathlib import Path
 import re
 from typing import Any, Iterable, Iterator
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from .models import _json_safe
+from .parquet_io import (
+    estimated_record_bytes,
+    iter_comment_records,
+    normalize_comment_record,
+    write_comment_records,
+)
 
 
 def _utc_now() -> str:
@@ -65,7 +67,6 @@ class _GroupShardWriter:
         dataset: str,
         language: str,
         *,
-        output_format: str,
         max_records_per_shard: int,
         max_bytes_per_shard: int,
         shard_prefix: str = "part",
@@ -75,7 +76,6 @@ class _GroupShardWriter:
         self.language = language
         self.directory = root / _path_segment(dataset) / _path_segment(language)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.output_format = output_format
         self.max_records_per_shard = max_records_per_shard
         self.max_bytes_per_shard = max_bytes_per_shard
         self.shard_prefix = shard_prefix
@@ -84,14 +84,11 @@ class _GroupShardWriter:
         self._current_bytes = 0
         self._current_records = 0
         self._next_shard_index = self._discover_next_shard_index()
-        self.extension = "parquet" if output_format == "parquet" else "jsonl"
-        self.shard_paths: list[Path] = sorted(self.directory.glob(f"part-*.{self.extension}"))
+        self.shard_paths: list[Path] = sorted(self.directory.glob("part-*.parquet"))
 
     def _discover_next_shard_index(self) -> int:
         next_index = 0
-        for path in list(self.directory.glob(f"{self.shard_prefix}-*.jsonl")) + list(
-            self.directory.glob(f"{self.shard_prefix}-*.parquet")
-        ):
+        for path in self.directory.glob(f"{self.shard_prefix}-*.parquet"):
             try:
                 next_index = max(next_index, int(path.stem.split("-")[-1]) + 1)
             except ValueError:
@@ -99,42 +96,33 @@ class _GroupShardWriter:
         return next_index
 
     def write(self, record: dict[str, Any]) -> Path:
-        safe_record = _normalize_export_record(record)
-        encoded = (json.dumps(safe_record, ensure_ascii=False) + "\n").encode("utf-8")
+        safe_record = normalize_comment_record(record)
+        encoded_bytes = estimated_record_bytes(safe_record)
         if self._handle is None:
             self._open_next_shard()
         elif (
             self._current_records >= self.max_records_per_shard
-            or self._current_bytes + len(encoded) > self.max_bytes_per_shard
+            or self._current_bytes + encoded_bytes > self.max_bytes_per_shard
         ):
             self._open_next_shard()
 
-        if self.output_format == "jsonl":
-            assert self._handle is not None
-            self._handle.write(encoded.decode("utf-8"))
-        else:
-            self._buffered_records.append(safe_record)
-        self._current_bytes += len(encoded)
+        self._buffered_records.append(safe_record)
+        self._current_bytes += encoded_bytes
         self._current_records += 1
         return self.shard_paths[-1]
 
     def close(self) -> None:
-        if self.output_format == "parquet" and self._buffered_records:
+        if self._buffered_records:
             assert self.shard_paths
-            _write_parquet_records(self.shard_paths[-1], self._buffered_records)
+            write_comment_records(self.shard_paths[-1], self._buffered_records)
             self._buffered_records = []
-        if self.output_format == "jsonl" and self._handle is not None:
-            self._handle.close()
         self._handle = None
 
     def _open_next_shard(self) -> None:
         self.close()
-        path = self.directory / f"{self.shard_prefix}-{self._next_shard_index:05d}.{self.extension}"
+        path = self.directory / f"{self.shard_prefix}-{self._next_shard_index:05d}.parquet"
         self._next_shard_index += 1
-        if self.output_format == "jsonl":
-            self._handle = path.open("a", encoding="utf-8")
-        else:
-            self._handle = object()
+        self._handle = object()
         self._current_bytes = 0
         self._current_records = 0
         if path not in self.shard_paths:
@@ -146,14 +134,12 @@ class _WriterCache:
         self,
         root: Path,
         *,
-        output_format: str,
         max_open_writers: int,
         max_records_per_shard: int,
         max_bytes_per_shard: int,
         shard_prefix: str = "part",
     ) -> None:
         self.root = root
-        self.output_format = output_format
         self.max_open_writers = max_open_writers
         self.max_records_per_shard = max_records_per_shard
         self.max_bytes_per_shard = max_bytes_per_shard
@@ -175,7 +161,6 @@ class _WriterCache:
             self.root,
             dataset,
             language,
-            output_format=self.output_format,
             max_records_per_shard=self.max_records_per_shard,
             max_bytes_per_shard=self.max_bytes_per_shard,
             shard_prefix=self.shard_prefix,
@@ -189,24 +174,16 @@ class _WriterCache:
         self._writers.clear()
 
 
-def _iter_jsonl_records(paths: list[Path]) -> Iterator[dict[str, Any]]:
-    for path in paths:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    yield json.loads(line)
-
-
 def iter_mined_comment_record_groups(output_directory: Path) -> Iterator[tuple[Path, Iterator[dict[str, Any]]]]:
     for group_directory in _mined_comment_group_directories(output_directory):
-        paths = sorted(group_directory.glob("*/part-*.jsonl"))
-        yield group_directory, _iter_jsonl_records(paths)
+        paths = sorted(group_directory.glob("*/part-*.parquet"))
+        yield group_directory, iter_comment_records(paths)
 
 
 def _mined_comment_group_directories(output_directory: Path) -> list[Path]:
     groups: list[Path] = []
     for group_directory in sorted(path for path in output_directory.iterdir() if path.is_dir()):
-        paths = sorted(group_directory.glob("*/part-*.jsonl"))
+        paths = sorted(group_directory.glob("*/part-*.parquet"))
         if paths:
             groups.append(group_directory)
     return groups
@@ -221,7 +198,6 @@ def export_huggingface_dataset(
     input_directory: Path,
     output_directory: Path,
     *,
-    output_format: str = "parquet",
     max_records_per_shard: int,
     max_bytes_per_shard: int,
     dedupe_record_ids: bool = False,
@@ -230,8 +206,6 @@ def export_huggingface_dataset(
     max_open_writers: int = 64,
     workers: int = 1,
 ) -> ExportStats:
-    if output_format not in {"parquet", "jsonl"}:
-        raise ValueError(f"Unsupported export format: {output_format}")
     if dedupe_scope not in {"global", "input-group"}:
         raise ValueError(f"Unsupported dedupe scope: {dedupe_scope}")
     if dataset_card_layout not in {"dataset-language-configs", "language-splits"}:
@@ -246,7 +220,6 @@ def export_huggingface_dataset(
         stats = _export_huggingface_dataset_parallel(
             group_directories,
             output_directory,
-            output_format=output_format,
             max_records_per_shard=max_records_per_shard,
             max_bytes_per_shard=max_bytes_per_shard,
             dedupe_record_ids=dedupe_record_ids,
@@ -258,7 +231,6 @@ def export_huggingface_dataset(
         stats = _export_mined_comment_groups(
             group_directories,
             output_directory,
-            output_format=output_format,
             max_records_per_shard=max_records_per_shard,
             max_bytes_per_shard=max_bytes_per_shard,
             dedupe_record_ids=dedupe_record_ids,
@@ -268,14 +240,12 @@ def export_huggingface_dataset(
 
     _write_export_manifest(
         stats,
-        output_format=output_format,
         dedupe_scope=dedupe_scope if dedupe_record_ids else None,
         dataset_card_layout=dataset_card_layout,
         workers=workers,
     )
     _write_dataset_card(
         stats,
-        output_format=output_format,
         layout=dataset_card_layout,
     )
     return stats
@@ -285,7 +255,6 @@ def _export_mined_comment_groups(
     group_directories: Iterable[Path],
     output_directory: Path,
     *,
-    output_format: str,
     max_records_per_shard: int,
     max_bytes_per_shard: int,
     dedupe_record_ids: bool,
@@ -295,7 +264,6 @@ def _export_mined_comment_groups(
 ) -> ExportStats:
     writers = _WriterCache(
         output_directory,
-        output_format=output_format,
         max_open_writers=max_open_writers,
         max_records_per_shard=max_records_per_shard,
         max_bytes_per_shard=max_bytes_per_shard,
@@ -306,7 +274,7 @@ def _export_mined_comment_groups(
 
     try:
         for group_directory in group_directories:
-            records = _iter_jsonl_records(sorted(group_directory.glob("*/part-*.jsonl")))
+            records = iter_comment_records(sorted(group_directory.glob("*/part-*.parquet")))
             group_seen_record_ids: set[tuple[str, str]] = set()
             seen_record_ids = (
                 global_seen_record_ids
@@ -324,7 +292,7 @@ def _export_mined_comment_groups(
                 if dedupe_record_ids:
                     seen_record_ids.add(dedupe_key)
 
-                record = _normalize_export_record(record)
+                record = normalize_comment_record(record)
                 writer = writers.writer_for(dataset, language)
                 shard_path = writer.write(record)
 
@@ -347,7 +315,6 @@ def _export_huggingface_dataset_parallel(
     group_directories: list[Path],
     output_directory: Path,
     *,
-    output_format: str,
     max_records_per_shard: int,
     max_bytes_per_shard: int,
     dedupe_record_ids: bool,
@@ -364,7 +331,6 @@ def _export_huggingface_dataset_parallel(
                 _export_mined_comment_groups,
                 chunk,
                 output_directory,
-                output_format=output_format,
                 max_records_per_shard=max_records_per_shard,
                 max_bytes_per_shard=max_bytes_per_shard,
                 dedupe_record_ids=dedupe_record_ids,
@@ -407,7 +373,6 @@ def _merge_export_stats(target: ExportStats, source: ExportStats) -> None:
 def _write_export_manifest(
     stats: ExportStats,
     *,
-    output_format: str,
     dedupe_scope: str | None,
     dataset_card_layout: str,
     workers: int,
@@ -417,8 +382,8 @@ def _write_export_manifest(
         "records_written": stats.records_written,
         "records_skipped_duplicate": stats.records_skipped_duplicate,
         "dedupe_scope": dedupe_scope,
-        "format": output_format,
-        "layout": f"<dataset>/<language>/part-*.{output_format}",
+        "format": "parquet",
+        "layout": "<dataset>/<language>/part-*.parquet",
         "dataset_card_layout": dataset_card_layout,
         "workers": workers,
         "groups": [
@@ -440,7 +405,6 @@ def _write_export_manifest(
 def _write_dataset_card(
     stats: ExportStats,
     *,
-    output_format: str,
     layout: str,
 ) -> None:
     lines = [
@@ -482,7 +446,7 @@ def _write_dataset_card(
                 shard_pattern = (
                     f"{_path_segment(group.dataset)}/"
                     f"{_path_segment(group.language)}/"
-                    f"part-*.{output_format}"
+                    "part-*.parquet"
                 )
                 lines.extend(
                     [
@@ -500,7 +464,7 @@ def _write_dataset_card(
             "",
             "Opening comments extracted from code datasets with CommentMiner and ML4SE-toolkit.",
             "",
-            f"Files are grouped as `<dataset>/<language>/part-*.{output_format}`.",
+            "Files are grouped as `<dataset>/<language>/part-*.parquet`.",
             "",
             (
                 "The Hugging Face dataset card declares one config per source dataset "
@@ -519,45 +483,3 @@ def _write_dataset_card(
         ]
     )
     (stats.output_directory / "README.md").write_text("\n".join(lines), encoding="utf-8")
-
-
-_EXPORT_SCHEMA = pa.schema(
-    [
-        ("dataset", pa.string()),
-        ("record_id", pa.string()),
-        ("opening_comment", pa.string()),
-        ("language", pa.string()),
-        ("path", pa.string()),
-        ("repo", pa.string()),
-        ("extracted_at", pa.string()),
-        ("metadata", pa.string()),
-    ]
-)
-
-
-def _normalize_export_record(record: dict[str, Any]) -> dict[str, Any]:
-    safe_record = _json_safe(record)
-    metadata = safe_record.get("metadata")
-    if not isinstance(metadata, str):
-        metadata = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
-    return {
-        "dataset": _string_or_none(safe_record.get("dataset")),
-        "record_id": _string_or_none(safe_record.get("record_id")),
-        "opening_comment": _string_or_none(safe_record.get("opening_comment")),
-        "language": _string_or_none(safe_record.get("language")),
-        "path": _string_or_none(safe_record.get("path")),
-        "repo": _string_or_none(safe_record.get("repo")),
-        "extracted_at": _string_or_none(safe_record.get("extracted_at")),
-        "metadata": metadata,
-    }
-
-
-def _string_or_none(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
-
-
-def _write_parquet_records(path: Path, records: list[dict[str, Any]]) -> None:
-    table = pa.Table.from_pylist(records, schema=_EXPORT_SCHEMA)
-    pq.write_table(table, path)

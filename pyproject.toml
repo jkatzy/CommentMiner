@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "commentminer"
 version = "0.1.0"
-description = "Storage-aware pipeline scaffolding for mining opening comments from large code datasets."
+description = "Hugging Face Parquet pipeline for mining and ScanCode-scoring opening comments."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

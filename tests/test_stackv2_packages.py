@@ -358,16 +358,15 @@ class StackV2PackageTests(unittest.TestCase):
             self.assertEqual(summary.records_seen, 5)
             self.assertEqual(summary.comments_written, 5)
             output_records = []
-            for path in config.storage.output_directory.rglob("part-*.jsonl"):
-                output_records.extend(
-                    json.loads(line)
-                    for line in path.read_text(encoding="utf-8").splitlines()
-                    if line
-                )
+            for path in config.storage.output_directory.rglob("part-*.parquet"):
+                output_records.extend(pq.read_table(path).to_pylist())
             self.assertEqual(len(output_records), 5)
             self.assertEqual({record["dataset"] for record in output_records}, {"the-stack-v2"})
             self.assertEqual(
-                {record["metadata"]["stack_v2_id_package_index"] for record in output_records},
+                {
+                    json.loads(record["metadata"])["stack_v2_id_package_index"]
+                    for record in output_records
+                },
                 {0, 1, 2},
             )
 

@@ -11,6 +11,7 @@ import shlex
 import subprocess
 from typing import Any, Callable, Iterable, Sequence
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .models import _json_safe
@@ -22,6 +23,25 @@ _DEFAULT_BATCH_SIZE = 8192
 _DEFAULT_TOPIC_SAMPLE_SIZE = 10
 _DEFAULT_JUDGE_SAMPLE_SIZE = 8
 _DEFAULT_JUDGE_MAX_COMMENT_CHARS = 1200
+_TOPIC_ASSIGNMENT_SCHEMA = pa.schema(
+    [
+        ("ordinal", pa.int64()),
+        ("topic_id", pa.int64()),
+        ("topic_label", pa.string()),
+        ("topic_probability", pa.float64()),
+        ("source_path", pa.string()),
+        ("source_row_index", pa.int64()),
+        ("dataset", pa.string()),
+        ("record_id", pa.string()),
+        ("language", pa.string()),
+        ("path", pa.string()),
+        ("repo", pa.string()),
+        ("comment_license_score", pa.float64()),
+        ("comment_license_score_percent", pa.float64()),
+        ("opening_comment", pa.string()),
+        ("source_record", pa.string()),
+    ]
+)
 
 
 def _utc_now() -> str:
@@ -159,7 +179,7 @@ def run_low_scancode_topic_modelling(
         shards_read=loaded.shards_read,
     )
 
-    assignments_path = output_directory / "topic-assignments.jsonl"
+    assignments_path = output_directory / "topic-assignments.parquet"
     topics_path = output_directory / "topics.json"
     stats.assignments_path = assignments_path
     stats.topics_path = topics_path
@@ -332,32 +352,15 @@ def _load_low_score_comments(
         dataset_filter=dataset_filter,
         language_filter=language_filter,
     )
-    jsonl_shards = sorted(input_directory.glob("part-*.jsonl"))
     if max_shards is not None:
         parquet_shards = parquet_shards[:max_shards]
-        jsonl_shards = jsonl_shards[:max_shards]
-    if not parquet_shards and not jsonl_shards:
-        raise ValueError(f"No ScanCode-enriched JSONL or Parquet shards found in: {input_directory}")
+    if not parquet_shards:
+        raise ValueError(f"No ScanCode-enriched Parquet shards found in: {input_directory}")
 
     loaded = _LoadedComments(
         comments=[],
-        input_format=(
-            "mixed"
-            if parquet_shards and jsonl_shards
-            else "parquet"
-            if parquet_shards
-            else "jsonl"
-        ),
+        input_format="parquet",
     )
-    for shard in jsonl_shards:
-        _load_jsonl_low_score_comments(
-            shard,
-            input_directory,
-            loaded,
-            score_threshold=score_threshold,
-            dataset_filter=dataset_filter,
-            language_filter=language_filter,
-        )
     for shard in parquet_shards:
         _load_parquet_low_score_comments(
             shard,
@@ -369,33 +372,6 @@ def _load_low_score_comments(
             language_filter=language_filter,
         )
     return loaded
-
-
-def _load_jsonl_low_score_comments(
-    shard: Path,
-    input_directory: Path,
-    loaded: _LoadedComments,
-    *,
-    score_threshold: float,
-    dataset_filter: set[str],
-    language_filter: set[str],
-) -> None:
-    relative_path = shard.relative_to(input_directory).as_posix()
-    with shard.open(encoding="utf-8") as handle:
-        for row_index, line in enumerate(handle):
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            _maybe_add_low_score_comment(
-                payload,
-                loaded,
-                score_threshold=score_threshold,
-                dataset_filter=dataset_filter,
-                language_filter=language_filter,
-                source_path=relative_path,
-                source_row_index=row_index,
-            )
-    loaded.shards_read += 1
 
 
 def _load_parquet_low_score_comments(
@@ -534,10 +510,11 @@ def _write_topic_assignments(
     *,
     topic_labels: dict[int, str],
 ) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for index, comment in enumerate(comments):
-            topic_id = int(topics[index])
-            payload = {
+    rows = []
+    for index, comment in enumerate(comments):
+        topic_id = int(topics[index])
+        rows.append(
+            {
                 "ordinal": comment.ordinal,
                 "topic_id": topic_id,
                 "topic_label": topic_labels.get(topic_id, f"Topic {topic_id}"),
@@ -552,9 +529,13 @@ def _write_topic_assignments(
                 "comment_license_score": comment.score,
                 "comment_license_score_percent": comment.score_percent,
                 "opening_comment": comment.text,
-                "source_record": comment.payload,
+                "source_record": json.dumps(
+                    _json_safe(comment.payload), ensure_ascii=False, sort_keys=True
+                ),
             }
-            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
+        )
+    table = pa.Table.from_pylist(rows, schema=_TOPIC_ASSIGNMENT_SCHEMA)
+    pq.write_table(table, path, compression="zstd")
 
 
 def _write_topics_json(path: Path, topic_summaries: Sequence[dict[str, Any]]) -> None:
@@ -625,6 +606,7 @@ def _hf_parquet_shards(
     language_filter: set[str],
 ) -> list[Path]:
     shards: list[Path] = []
+    shards.extend(sorted(input_directory.glob("part-*.parquet")))
     for path in sorted(input_directory.glob("*/*/part-*.parquet")):
         relative = path.relative_to(input_directory)
         if len(relative.parts) < 3 or relative.parts[0].startswith("."):

@@ -49,12 +49,9 @@ class FakeEncoder:
         return np.zeros((len(texts), 4), dtype=np.float32)
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    pq.write_table(pa.Table.from_pylist(rows), path)
 
 
 class EncodingBenchmarkTests(unittest.TestCase):
@@ -91,13 +88,13 @@ class EncodingBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the supported 2M-8B range"):
             parse_encoding_model_spec("too-large/model=8.1B")
 
-    def test_benchmarks_jsonl_sample_counts_and_records_failures(self) -> None:
+    def test_benchmarks_parquet_sample_counts_and_records_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             input_directory = root / "comments"
             output_directory = root / "benchmark"
-            _write_jsonl(
-                input_directory / "part-00000.jsonl",
+            _write_parquet(
+                input_directory / "combined" / "Python" / "part-00000.parquet",
                 [
                     {"dataset": "combined", "language": "Python", "opening_comment": "first"},
                     {"dataset": "combined", "language": "Python", "opening_comment": "second"},
@@ -120,7 +117,7 @@ class EncodingBenchmarkTests(unittest.TestCase):
                 encoder_loader=_loader,
             )
 
-            self.assertEqual(stats.input_format, "jsonl")
+            self.assertEqual(stats.input_format, "parquet")
             self.assertEqual(stats.records_seen, 5)
             self.assertEqual(stats.records_without_text, 1)
             self.assertEqual(stats.samples_loaded, 4)

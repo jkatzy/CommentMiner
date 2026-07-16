@@ -112,13 +112,14 @@ class MiningTests(unittest.TestCase):
 
             self.assertEqual(stats.records_seen, 2)
             self.assertEqual(stats.comments_written, 1)
-            shard_path = next(config.storage.output_directory.rglob("part-00000.jsonl"))
-            payload = json.loads(shard_path.read_text(encoding="utf-8").splitlines()[0])
+            shard_path = next(config.storage.output_directory.rglob("part-00000.parquet"))
+            payload = pq.read_table(shard_path).to_pylist()[0]
+            metadata = json.loads(payload["metadata"])
             self.assertEqual(payload["opening_comment"], "# first comment\n# second line")
             self.assertNotIn("content", payload)
-            self.assertEqual(payload["metadata"]["hexsha"], "a1")
-            self.assertEqual(payload["metadata"]["ext"], "python")
-            self.assertEqual(payload["metadata"]["created_at"], "2026-01-02T03:04:05+00:00")
+            self.assertEqual(metadata["hexsha"], "a1")
+            self.assertEqual(metadata["ext"], "python")
+            self.assertEqual(metadata["created_at"], "2026-01-02T03:04:05+00:00")
             self.assertEqual(payload["path"], "src/a.py")
 
 

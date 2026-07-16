@@ -40,22 +40,19 @@ class FakeTopicModel:
         (Path(path) / "model.txt").write_text("saved", encoding="utf-8")
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    pq.write_table(pa.Table.from_pylist(rows), path)
 
 
 class TopicModellingTests(unittest.TestCase):
-    def test_models_jsonl_comments_below_normalized_scancode_threshold_and_runs_codex_judge(self) -> None:
+    def test_models_comments_below_normalized_scancode_threshold_and_runs_codex_judge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             input_directory = root / "license-scan"
             output_directory = root / "topics"
-            _write_jsonl(
-                input_directory / "part-00000.jsonl",
+            _write_parquet(
+                input_directory / "combined" / "Python" / "part-00000.parquet",
                 [
                     {
                         "dataset": "combined",
@@ -64,7 +61,7 @@ class TopicModellingTests(unittest.TestCase):
                         "language": "Python",
                         "path": "a.py",
                         "repo": "repo-a",
-                        "metadata": {},
+                        "metadata": "{}",
                         "comment_license_score": 80.0,
                     },
                     {
@@ -74,7 +71,7 @@ class TopicModellingTests(unittest.TestCase):
                         "language": "Python",
                         "path": "b.py",
                         "repo": "repo-b",
-                        "metadata": {},
+                        "metadata": "{}",
                         "comment_license_score": 0.94,
                     },
                     {
@@ -84,7 +81,7 @@ class TopicModellingTests(unittest.TestCase):
                         "language": "Python",
                         "path": "c.py",
                         "repo": "repo-c",
-                        "metadata": {},
+                        "metadata": "{}",
                         "comment_license_score": 95.0,
                     },
                     {
@@ -94,7 +91,7 @@ class TopicModellingTests(unittest.TestCase):
                         "language": "Python",
                         "path": "d.py",
                         "repo": "repo-d",
-                        "metadata": {},
+                        "metadata": "{}",
                     },
                     {
                         "dataset": "combined",
@@ -103,7 +100,7 @@ class TopicModellingTests(unittest.TestCase):
                         "language": "Python",
                         "path": "e.py",
                         "repo": "repo-e",
-                        "metadata": {},
+                        "metadata": "{}",
                         "comment_license_score": 10.0,
                     },
                 ],
@@ -151,10 +148,9 @@ class TopicModellingTests(unittest.TestCase):
             self.assertTrue(prompts)
             self.assertIn("Cluster data", prompts[0])
 
-            assignments = [
-                json.loads(line)
-                for line in (output_directory / "topic-assignments.jsonl").read_text(encoding="utf-8").splitlines()
-            ]
+            assignments = pq.read_table(
+                output_directory / "topic-assignments.parquet"
+            ).to_pylist()
             self.assertEqual([row["record_id"] for row in assignments], ["low-80", "low-ratio"])
             self.assertEqual([row["comment_license_score_percent"] for row in assignments], [80.0, 94.0])
             self.assertEqual([row["topic_id"] for row in assignments], [0, 1])
@@ -254,10 +250,9 @@ class TopicModellingTests(unittest.TestCase):
             self.assertEqual(stats.records_seen, 2)
             self.assertEqual(stats.records_selected, 1)
 
-            assignments = [
-                json.loads(line)
-                for line in (root / "topics" / "topic-assignments.jsonl").read_text(encoding="utf-8").splitlines()
-            ]
+            assignments = pq.read_table(
+                root / "topics" / "topic-assignments.parquet"
+            ).to_pylist()
             self.assertEqual(len(assignments), 1)
             self.assertEqual(assignments[0]["record_id"], "py-low")
             self.assertEqual(assignments[0]["source_path"], "the-stack/Python/part-00000.parquet")

@@ -5,7 +5,6 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import gzip
-import json
 import logging
 from pathlib import Path, PurePosixPath
 import random
@@ -29,7 +28,6 @@ from .models import InputRecord
 
 
 _ROW_ID_SEPARATOR = "::row::"
-_URL_LINE_SEPARATOR = "::line::"
 _PROCESSED_CHECKPOINT_NAMESPACE = "processed-shards"
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,8 +47,6 @@ _DEFAULT_REPO_COLUMNS = [
     "repo_name",
     "meta.repo_name",
 ]
-_DEFAULT_URL_STREAM_RETRIES = 5
-_DEFAULT_URL_STREAM_RETRY_BACKOFF_SECONDS = 10.0
 _DEFAULT_PREFETCH_FILES = 4
 _DEFAULT_DOWNLOAD_WORKERS = 4
 _DEFAULT_STACK_V2_CONTENT_URL_TEMPLATE = "s3://softwareheritage/content/{blob_id}"
@@ -61,91 +57,6 @@ _DEFAULT_STACK_V2_CONTENT_PREFETCH_MULTIPLIER = 4
 _DEFAULT_STACK_V2_S3_MAX_POOL_CONNECTIONS = 1024
 _DEFAULT_STACK_V2_S3_READ_RETRIES = 6
 _DEFAULT_STACK_V2_S3_RETRY_BACKOFF_SECONDS = 0.25
-_FILENAME_LANGUAGE_ALIASES = {
-    "dockerfile": "dockerfile",
-    "makefile": "makefile",
-}
-_EXTENSION_LANGUAGE_ALIASES = {
-    "adoc": "asciidoc",
-    "as": "actionscript",
-    "bash": "shell",
-    "bat": "batchfile",
-    "cc": "c++",
-    "cjs": "javascript",
-    "clj": "clojure",
-    "cls": "apex",
-    "cmake": "cmake",
-    "cpp": "c++",
-    "cs": "c#",
-    "csh": "shell",
-    "css": "css",
-    "cu": "cuda",
-    "cuh": "cuda",
-    "cxx": "c++",
-    "dart": "dart",
-    "erl": "erlang",
-    "ex": "elixir",
-    "exs": "elixir",
-    "fs": "f#",
-    "fsi": "f#",
-    "fsx": "f#",
-    "go": "go",
-    "gradle": "gradle",
-    "groovy": "groovy",
-    "gsp": "groovy_server_pages",
-    "hh": "c++",
-    "hs": "haskell",
-    "html": "html",
-    "hpp": "c++",
-    "hxx": "c++",
-    "java": "java",
-    "jl": "julia",
-    "js": "javascript",
-    "jsx": "javascript",
-    "kt": "kotlin",
-    "kts": "kotlin",
-    "less": "less",
-    "lisp": "lisp",
-    "lua": "lua",
-    "mjs": "javascript",
-    "mm": "objective_cpp",
-    "php": "php",
-    "pl": "perl",
-    "pm": "perl",
-    "ps1": "powershell",
-    "py": "python",
-    "pyw": "python",
-    "rake": "ruby",
-    "rb": "ruby",
-    "rst": "restructuredtext",
-    "rs": "rust",
-    "scala": "scala",
-    "scss": "scss",
-    "sh": "shell",
-    "sql": "sql",
-    "swift": "swift",
-    "ts": "typescript",
-    "tsx": "tsx",
-    "vb": "visual_basic_net",
-    "vue": "vue",
-    "zsh": "shell",
-}
-_COMPOUND_EXTENSION_LANGUAGE_ALIASES = {
-    "blade.php": "blade",
-    "d.ts": "typescript",
-}
-_AMBIGUOUS_EXTENSION_LANGUAGE_ALIASES = {
-    "h": ["c++", "c", "objective-c"],
-    "m": ["objective-c", "matlab", "mathematica"],
-    "r": ["r", "rebol"],
-}
-
-
-@dataclass(frozen=True, slots=True)
-class _TextLine:
-    text: str
-    next_byte_offset: int | None = None
-    resumed_from_byte: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,22 +73,6 @@ class ShardRowCursor:
         if not separator:
             raise ValueError(f"Invalid shard row record id: {value}")
         return cls(remote_path=remote_path, row_index=int(row_index))
-
-
-@dataclass(frozen=True, slots=True)
-class UrlLineCursor:
-    url: str
-    line_index: int
-
-    def to_record_id(self) -> str:
-        return f"{self.url}{_URL_LINE_SEPARATOR}{self.line_index}"
-
-    @classmethod
-    def parse(cls, value: str) -> "UrlLineCursor":
-        url, separator, line_index = value.rpartition(_URL_LINE_SEPARATOR)
-        if not separator:
-            raise ValueError(f"Invalid URL line record id: {value}")
-        return cls(url=url, line_index=int(line_index))
 
 
 class HuggingFaceParquetSource:
@@ -1566,257 +1461,6 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
         )
 
 
-class UrlListJsonlSource:
-    def __init__(
-        self,
-        config: PipelineConfig,
-        dataset: DatasetSpec,
-        *,
-        language: str | None = None,
-        show_progress: bool = True,
-        token: str | bool | None = None,
-        downloader: HuggingFaceDownloader | None = None,
-        max_files: int | None = None,
-    ) -> None:
-        self.name = _source_run_name(dataset.name, language)
-        self.config = config
-        self.dataset = dataset
-        self.language = language
-        self.show_progress = show_progress
-        self.token = token
-        self.downloader = downloader or HuggingFaceDownloader()
-        self.max_files = max_files
-        self.stream_retries = _nonnegative_int_option(
-            dataset.extra.get("stream_retries"),
-            dataset.extra.get("url_stream_retries"),
-            default=_DEFAULT_URL_STREAM_RETRIES,
-        )
-        self.stream_retry_backoff_seconds = _nonnegative_float_option(
-            dataset.extra.get("stream_retry_backoff_seconds"),
-            dataset.extra.get("url_stream_retry_backoff_seconds"),
-            default=_DEFAULT_URL_STREAM_RETRY_BACKOFF_SECONDS,
-        )
-        self.content_columns = _string_list_option(
-            dataset.extra.get("content_columns"),
-            _DEFAULT_CONTENT_COLUMNS,
-        )
-        self.language_columns = _string_list_option(
-            dataset.extra.get("language_columns"),
-            _DEFAULT_LANGUAGE_COLUMNS,
-        )
-        self.language_hint_columns = _string_list_option(
-            dataset.extra.get("language_hint_columns"),
-            [],
-        )
-        self.infer_language_from_path = _bool_option(
-            dataset.extra.get("infer_language_from_path"),
-            default=False,
-        )
-        self.path_columns = _string_list_option(
-            dataset.extra.get("path_columns"),
-            _DEFAULT_PATH_COLUMNS,
-        )
-        self.repo_columns = _string_list_option(
-            dataset.extra.get("repo_columns"),
-            _DEFAULT_REPO_COLUMNS,
-        )
-
-    def iter_records(self, start_after: str | None = None) -> Iterator[InputRecord]:
-        self.config.ensure_directories()
-        resume_cursor = UrlLineCursor.parse(start_after) if start_after else None
-        urls = self._load_urls()
-        if self.max_files is not None:
-            urls = urls[: self.max_files]
-        _LOGGER.info(
-            "Preparing URL-list JSONL source dataset=%s language=%s urls=%s resume_from=%s",
-            self.dataset.name,
-            self.language or "all",
-            len(urls),
-            start_after,
-        )
-
-        started = resume_cursor is None
-        for url in urls:
-            if not started:
-                if resume_cursor and url == resume_cursor.url:
-                    started = True
-                else:
-                    continue
-            start_line = (
-                resume_cursor.line_index + 1
-                if resume_cursor and resume_cursor.url == url
-                else 0
-            )
-            yield from self._iter_url_records(url, start_line)
-            resume_cursor = None
-
-    def _load_urls(self) -> list[str]:
-        configured_urls = self.dataset.extra.get("urls")
-        if configured_urls is not None:
-            return [str(item) for item in configured_urls]
-
-        url_list_path = self.dataset.extra.get("url_list_path")
-        if url_list_path is None:
-            raise ValueError(
-                f"Dataset '{self.dataset.name}' must define extra.url_list_path or extra.urls"
-            )
-
-        local_path = self.downloader.download_remote_file(
-            self.config,
-            self.dataset,
-            str(url_list_path),
-            language=None,
-            token=self.token,
-            use_cache=False,
-        )
-        try:
-            return [
-                line.strip()
-                for line in local_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        finally:
-            if self.dataset.streaming:
-                self.downloader.remove_local_file(
-                    self.config,
-                    self.dataset,
-                    str(url_list_path),
-                    language=None,
-                )
-
-    def _iter_url_records(self, url: str, start_line: int) -> Iterator[InputRecord]:
-        _LOGGER.info(
-            "Streaming JSONL URL dataset=%s language=%s url=%s start_line=%s stream_retries=%s",
-            self.dataset.name,
-            self.language or "all",
-            url,
-            start_line,
-            self.stream_retries,
-        )
-        progress = tqdm(
-            desc=_progress_description(self.dataset.name, url),
-            initial=start_line,
-            unit="rows",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not self.show_progress,
-        )
-        next_line_index = start_line
-        next_byte_offset: int | None = None
-        next_byte_line_index = 0
-        retries_used = 0
-        try:
-            while True:
-                stream_start_byte = next_byte_offset or 0
-                try:
-                    line_index_base: int | None = None
-                    for relative_line_index, text_line in enumerate(
-                        _iter_text_lines(url, start_byte=stream_start_byte)
-                    ):
-                        if line_index_base is None:
-                            line_index_base = (
-                                next_byte_line_index
-                                if stream_start_byte > 0 and text_line.resumed_from_byte
-                                else 0
-                            )
-                        line_index = line_index_base + relative_line_index
-                        if text_line.next_byte_offset is not None:
-                            next_byte_offset = text_line.next_byte_offset
-                            next_byte_line_index = line_index + 1
-                        if line_index < next_line_index:
-                            continue
-
-                        next_line_index = line_index + 1
-                        progress.update(1)
-                        if not text_line.text:
-                            continue
-                        row = json.loads(text_line.text)
-                        record = self._row_to_input_record(url, line_index, row)
-                        if self.language and not _language_matches(record.language, self.language):
-                            continue
-                        yield record
-                    return
-                except httpx.HTTPError as exc:
-                    if not _is_retryable_http_error(exc) or retries_used >= self.stream_retries:
-                        _LOGGER.exception(
-                            "Streaming JSONL URL failed dataset=%s language=%s url=%s next_line=%s next_byte_offset=%s next_byte_line=%s retries_used=%s",
-                            self.dataset.name,
-                            self.language or "all",
-                            url,
-                            next_line_index,
-                            next_byte_offset,
-                            next_byte_line_index,
-                            retries_used,
-                        )
-                        raise
-
-                    retries_used += 1
-                    sleep_seconds = self.stream_retry_backoff_seconds * retries_used
-                    _LOGGER.warning(
-                        "Retrying JSONL URL stream dataset=%s language=%s url=%s next_line=%s next_byte_offset=%s next_byte_line=%s retry=%s/%s sleep_seconds=%.1f error=%s",
-                        self.dataset.name,
-                        self.language or "all",
-                        url,
-                        next_line_index,
-                        next_byte_offset,
-                        next_byte_line_index,
-                        retries_used,
-                        self.stream_retries,
-                        sleep_seconds,
-                        exc,
-                    )
-                    if sleep_seconds > 0:
-                        time.sleep(sleep_seconds)
-        finally:
-            progress.close()
-
-    def _row_to_input_record(
-        self,
-        url: str,
-        line_index: int,
-        row: dict[str, Any],
-    ) -> InputRecord:
-        content = _first_lookup(row, self.content_columns)
-        path = _first_lookup(row, self.path_columns)
-        raw_language = _first_lookup(row, self.language_columns)
-        language_hints = _coerce_language_values(
-            _first_lookup(row, self.language_hint_columns)
-        )
-        if not language_hints:
-            language_hints = _coerce_language_values(raw_language)
-        path_language = (
-            _infer_language_from_path(path, hints=language_hints)
-            if self.infer_language_from_path
-            else None
-        )
-        language = path_language or _coerce_language(raw_language)
-        repo = _first_lookup(row, self.repo_columns)
-        metadata = {
-            key: value
-            for key, value in row.items()
-            if key not in set(self.content_columns)
-        }
-        metadata["remote_url"] = url
-        metadata["line_index"] = line_index
-        ext = _path_extension(path)
-        if ext is not None and "ext" not in metadata:
-            metadata["ext"] = ext
-        if path_language is not None:
-            metadata["path_language"] = path_language
-        if self.language is not None and _language_matches(language, self.language):
-            metadata["selected_language"] = self.language
-
-        return InputRecord(
-            dataset=self.dataset.name,
-            record_id=UrlLineCursor(url, line_index).to_record_id(),
-            content=str(content) if content is not None else "",
-            language=str(language) if language is not None else None,
-            path=str(path) if path is not None else None,
-            repo=str(repo) if repo is not None else None,
-            metadata=metadata,
-        )
-
-
 class _RemoteDownloadScheduler:
     def __init__(
         self,
@@ -1881,89 +1525,6 @@ class _RemoteDownloadScheduler:
             except StopIteration:
                 return
             self.pending.append((remote, self.executor.submit(self.source._download_remote, remote)))
-
-
-def _iter_text_lines(url: str, *, start_byte: int = 0) -> Iterator[_TextLine]:
-    if url.startswith("file://"):
-        path = Path(url.removeprefix("file://"))
-        yield from _iter_local_text_lines(path, start_byte=start_byte)
-        return
-
-    path = Path(url)
-    if path.exists():
-        yield from _iter_local_text_lines(path, start_byte=start_byte)
-        return
-
-    headers = {"Accept-Encoding": "identity"}
-    if start_byte > 0:
-        headers["Range"] = f"bytes={start_byte}-"
-    with httpx.stream("GET", url, follow_redirects=True, timeout=None, headers=headers) as response:
-        if start_byte > 0 and response.status_code == 416:
-            _LOGGER.info("HTTP range resume reached EOF url=%s start_byte=%s", url, start_byte)
-            return
-        resumed_from_byte = start_byte > 0 and response.status_code == 206
-        if start_byte > 0 and not resumed_from_byte:
-            _LOGGER.warning(
-                "HTTP server did not honor range request url=%s start_byte=%s status_code=%s",
-                url,
-                start_byte,
-                response.status_code,
-            )
-        response.raise_for_status()
-        byte_offset = start_byte if resumed_from_byte else 0
-        yield from _iter_byte_text_lines(
-            response.iter_bytes(),
-            byte_offset=byte_offset,
-            resumed_from_byte=resumed_from_byte,
-        )
-
-
-def _iter_local_text_lines(path: Path, *, start_byte: int = 0) -> Iterator[_TextLine]:
-    with path.open("rb") as handle:
-        if start_byte > 0:
-            handle.seek(start_byte)
-        yield from _iter_byte_text_lines(
-            iter(lambda: handle.read(1024 * 1024), b""),
-            byte_offset=start_byte,
-            resumed_from_byte=start_byte > 0,
-        )
-
-
-def _iter_byte_text_lines(
-    chunks: Iterator[bytes],
-    *,
-    byte_offset: int,
-    resumed_from_byte: bool,
-) -> Iterator[_TextLine]:
-    pending = b""
-    current_offset = byte_offset
-    for chunk in chunks:
-        if not chunk:
-            continue
-        pending += chunk
-        lines = pending.split(b"\n")
-        pending = lines.pop()
-        for line_bytes in lines:
-            current_offset += len(line_bytes) + 1
-            yield _TextLine(
-                text=_decode_jsonl_line(line_bytes),
-                next_byte_offset=current_offset,
-                resumed_from_byte=resumed_from_byte,
-            )
-
-    if pending:
-        current_offset += len(pending)
-        yield _TextLine(
-            text=_decode_jsonl_line(pending),
-            next_byte_offset=current_offset,
-            resumed_from_byte=resumed_from_byte,
-        )
-
-
-def _decode_jsonl_line(line: bytes) -> str:
-    if line.endswith(b"\r"):
-        line = line[:-1]
-    return line.decode("utf-8")
 
 
 def _decode_stack_v2_raw_content(
@@ -2119,44 +1680,6 @@ def _coerce_language_values(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _infer_language_from_path(raw_path: Any, *, hints: list[str]) -> str | None:
-    if raw_path is None:
-        return None
-    path = PurePosixPath(str(raw_path))
-    filename_language = _FILENAME_LANGUAGE_ALIASES.get(path.name.lower())
-    if filename_language is not None:
-        return filename_language
-
-    suffixes = [
-        suffix.removeprefix(".").lower()
-        for suffix in path.suffixes
-        if suffix and suffix != "."
-    ]
-    if not suffixes:
-        return None
-
-    for suffix_count in range(min(2, len(suffixes)), 1, -1):
-        compound = ".".join(suffixes[-suffix_count:])
-        language = _COMPOUND_EXTENSION_LANGUAGE_ALIASES.get(compound)
-        if language is not None:
-            return language
-
-    extension = suffixes[-1]
-    ambiguous = _AMBIGUOUS_EXTENSION_LANGUAGE_ALIASES.get(extension)
-    if ambiguous is not None:
-        return _select_ambiguous_language(ambiguous, hints)
-    return _EXTENSION_LANGUAGE_ALIASES.get(extension, extension)
-
-
-def _select_ambiguous_language(candidates: list[str], hints: list[str]) -> str:
-    by_key = {_language_key(candidate): candidate for candidate in candidates}
-    for hint in hints:
-        match = by_key.get(_language_key(hint))
-        if match is not None:
-            return match
-    return candidates[0]
-
-
 def _path_extension(raw_path: Any) -> str | None:
     if raw_path is None:
         return None
@@ -2164,16 +1687,6 @@ def _path_extension(raw_path: Any) -> str | None:
     if not suffix or suffix == ".":
         return None
     return suffix.removeprefix(".").lower()
-
-
-def _language_matches(candidate: str | None, selected: str) -> bool:
-    if candidate is None:
-        return False
-    return _language_key(candidate) == _language_key(selected)
-
-
-def _language_key(value: str) -> str:
-    return value.strip().lower().replace("_", "-").replace(" ", "-")
 
 
 def _optional_string(value: Any) -> str | None:

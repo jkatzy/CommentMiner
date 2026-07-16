@@ -2,7 +2,7 @@
 
 ## Summary
 
-Build a reproducible pipeline that mines opening comments from very large code datasets and writes them into one consolidated comment dataset. The repository should handle source-specific download and iteration logic, call out to `ml4se-tk` for comment extraction, and persist results in a form that can be resumed, validated, and merged across datasets.
+Build a reproducible Hugging Face-based pipeline that mines opening comments from very large code datasets and writes them into one consolidated Parquet dataset. The repository handles source-specific download and iteration logic, calls `ml4setk` for comment extraction, and persists results in a form that can be resumed, validated, scored, and materialized across datasets.
 
 ## Why This Matters
 
@@ -13,17 +13,18 @@ Build a reproducible pipeline that mines opening comments from very large code d
 
 ## Core Requirements
 
-- Read records from multiple upstream datasets.
+- Read Parquet records from configured Hugging Face dataset repositories.
 - Avoid full local copies whenever possible.
 - Extract opening comments with an external extractor.
 - Save output in a canonical schema with dataset provenance.
 - Resume from checkpoints after interruptions.
-- Support eventual merging of all source outputs into one dataset.
+- Materialize all source outputs into a Hugging Face-compatible Parquet tree.
+- Append ScanCode license detections and numeric scores without changing the source rows.
 
 ## Constraints
 
 - The Stack style datasets can exceed available storage by a large margin.
-- Some sources may require streaming, partial downloads, or staged processing.
+- Stack v2 requires staged Hugging Face metadata plus bounded Software Heritage blob hydration.
 - Source metadata is heterogeneous and may need normalization.
 - Failures are expected during long-running jobs and should not require restarting from scratch.
 
@@ -35,9 +36,9 @@ Build a reproducible pipeline that mines opening comments from very large code d
 - Output rows preserve dataset name, record identity, and source metadata.
 - Different source datasets can be transformed into the same output schema.
 
-## Open Questions
+## Deliberate Scope
 
-- Which source adapters should be implemented first?
-- What exact `ml4se-tk` extractor interface should the integration wrapper target?
-- Should the final output remain JSONL shards, Arrow/Parquet, or both?
-- What deduplication policy is needed when the same file appears in multiple corpora?
+- Hugging Face is the only configured source family.
+- Parquet is the only data-plane shard format from mining through scoring and analysis.
+- Record-ID deduplication is optional at Hugging Face materialization time and can be global or scoped to each input group.
+- JSON remains only for configuration, checkpoints, manifests, and structured report metadata.

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR=${ROOT_DIR:-/home/jovyan/work}
 REPO_ID=${REPO_ID:-Jkatzy/code-comments}
 FINAL_OUTPUT=${FINAL_OUTPUT:-var/code-comments-license-scan}
-DATASETS=${DATASETS:-redpajama-github,the-heap,the-stack,the-stack-v2-dedup}
+DATASETS=${DATASETS:-the-heap,the-stack,the-stack-v2-dedup}
 
 cd "$ROOT_DIR"
 

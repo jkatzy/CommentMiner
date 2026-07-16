@@ -6,8 +6,11 @@ import threading
 import unittest
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 from commentminer.config import PipelineConfig, StorageConfig
 from commentminer.models import ExtractedComment, InputRecord
+from commentminer.parquet_io import COMMENT_SCHEMA
 from commentminer.pipeline import run_dataset
 
 
@@ -104,14 +107,15 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(checkpoint["last_record_id"], "3")
             self.assertEqual(checkpoint["comments_written"], 2)
 
-            shard_paths = list(config.storage.output_directory.rglob("part-00000.jsonl"))
+            shard_paths = list(config.storage.output_directory.rglob("part-00000.parquet"))
             self.assertEqual(len(shard_paths), 1)
-            lines = shard_paths[0].read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(lines), 2)
-
-            payloads = [json.loads(line) for line in lines]
+            self.assertEqual(pq.read_schema(shard_paths[0]), COMMENT_SCHEMA)
+            parquet_file = pq.ParquetFile(shard_paths[0])
+            self.assertEqual(parquet_file.metadata.num_rows, 2)
+            payloads = parquet_file.read().to_pylist()
             self.assertEqual(payloads[0]["opening_comment"], "first")
             self.assertEqual(payloads[1]["opening_comment"], "second")
+            self.assertFalse(list(config.storage.output_directory.rglob(".*.tmp.*")))
 
     def test_run_dataset_writes_multiple_comments_from_one_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -139,11 +143,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(stats.comments_written, 2)
             self.assertEqual(stats.skipped_without_comment, 0)
 
-            shard_path = next(config.storage.output_directory.rglob("part-00000.jsonl"))
-            payloads = [
-                json.loads(line)
-                for line in shard_path.read_text(encoding="utf-8").strip().splitlines()
-            ]
+            shard_path = next(config.storage.output_directory.rglob("part-00000.parquet"))
+            payloads = pq.read_table(shard_path).to_pylist()
             self.assertEqual(
                 [payload["record_id"] for payload in payloads],
                 ["1::comment::0", "1::comment::1"],
@@ -152,8 +153,10 @@ class PipelineTests(unittest.TestCase):
                 [payload["opening_comment"] for payload in payloads],
                 ["first", "second"],
             )
-            self.assertEqual(payloads[0]["metadata"]["comment_start_line"], 2)
-            self.assertEqual(payloads[1]["metadata"]["comment_index"], 1)
+            first_metadata = json.loads(payloads[0]["metadata"])
+            second_metadata = json.loads(payloads[1]["metadata"])
+            self.assertEqual(first_metadata["comment_start_line"], 2)
+            self.assertEqual(second_metadata["comment_index"], 1)
 
     def test_run_dataset_extracts_comments_with_multiple_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -191,11 +194,8 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(len(extractor.thread_names), 2)
 
             payloads = []
-            for shard_path in sorted(config.storage.output_directory.rglob("part-*.jsonl")):
-                payloads.extend(
-                    json.loads(line)
-                    for line in shard_path.read_text(encoding="utf-8").strip().splitlines()
-                )
+            for shard_path in sorted(config.storage.output_directory.rglob("part-*.parquet")):
+                payloads.extend(pq.read_table(shard_path).to_pylist())
             self.assertEqual(
                 [payload["record_id"] for payload in payloads],
                 [str(index) for index in range(8)],

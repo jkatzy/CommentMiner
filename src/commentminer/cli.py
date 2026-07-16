@@ -10,10 +10,8 @@ from typing import Callable, Sequence
 
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from .aggregation import aggregate_comment_runs
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
-from .deduplication import deduplicate_comment_run
 from .encoding_benchmark import (
     load_encoding_model_specs,
     run_encoding_capacity_benchmark,
@@ -24,12 +22,11 @@ from .license_scanner import (
     build_license_score_histogram,
     format_license_score_histogram,
     prewarm_huggingface_license_detection_cache,
-    scan_comment_licenses,
     scan_huggingface_comment_licenses,
 )
 from .logging_utils import configure_logging
 from .pipeline import run_dataset
-from .sources import HuggingFaceParquetSource, StackV2SWHContentSource, UrlListJsonlSource
+from .sources import HuggingFaceParquetSource, StackV2SWHContentSource
 from .stackv2_packages import mine_stack_v2_id_packages
 from .topic_modelling import run_low_scancode_topic_modelling
 
@@ -42,7 +39,7 @@ _DEFAULT_DOWNLOAD_WORKERS = 4
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="commentminer",
-        description="Utilities for inspecting CommentMiner pipeline configuration.",
+        description="Mine, materialize, and score Hugging Face Parquet comment datasets.",
     )
     parser.add_argument(
         "--log-level",
@@ -154,116 +151,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tqdm",
         action="store_true",
         help="Disable per-shard tqdm progress bars during parquet streaming.",
-    )
-
-    aggregate = subparsers.add_parser(
-        "aggregate-comment-runs",
-        help="Combine extracted comment runs into one aggregated dataset before downstream processing.",
-    )
-    aggregate.add_argument("input_directories", type=Path, nargs="+")
-    aggregate.add_argument("--output-root", type=Path)
-    aggregate.add_argument(
-        "--dataset-name",
-        default="combined-comments",
-        help="Dataset name to assign to the aggregated output run.",
-    )
-    aggregate.add_argument(
-        "--source-field",
-        default="source_dataset",
-        help="Field name used to store the original source dataset on each aggregated record.",
-    )
-    aggregate.add_argument(
-        "--progress-every",
-        type=int,
-        default=1000,
-        help="Emit an aggregation progress log every N records.",
-    )
-
-    deduplicate = subparsers.add_parser(
-        "deduplicate-comment-run",
-        help="Deduplicate an aggregated comment run before downstream processing.",
-    )
-    deduplicate.add_argument("input_directory", type=Path)
-    deduplicate.add_argument("--output-root", type=Path)
-    deduplicate.add_argument(
-        "--dataset-name",
-        help="Dataset name to assign to the deduplicated output run. Defaults to <input-dataset>-deduplicated.",
-    )
-    deduplicate.add_argument(
-        "--source-field",
-        default="source_dataset",
-        help="Field name used to identify the original source dataset in each occurrence record.",
-    )
-    deduplicate.add_argument(
-        "--hash-workers",
-        type=int,
-        default=max(1, min(8, os.cpu_count() or 1)),
-        help="Number of worker processes to use while normalizing and hashing comments.",
-    )
-    deduplicate.add_argument(
-        "--hash-batch-size",
-        type=int,
-        default=1000,
-        help="Number of comments to hash per batch before writing to the temporary sort input.",
-    )
-    deduplicate.add_argument(
-        "--sort-parallelism",
-        type=int,
-        default=max(1, min(8, os.cpu_count() or 1)),
-        help="Parallelism hint passed to the external sort command.",
-    )
-    deduplicate.add_argument(
-        "--sort-command",
-        default="sort",
-        help="External sort executable used to group identical comment hashes.",
-    )
-    deduplicate.add_argument(
-        "--progress-every",
-        type=int,
-        default=1000,
-        help="Emit a deduplication progress log every N records or groups.",
-    )
-
-    scan_licenses = subparsers.add_parser(
-        "scan-comment-licenses",
-        help="Scan previously extracted comment shards for license notices using ScanCode.",
-    )
-    scan_licenses.add_argument("input_directory", type=Path)
-    scan_licenses.add_argument("--output-directory", type=Path)
-    scan_licenses.add_argument("--scancode", default="scancode")
-    scan_licenses.add_argument(
-        "--scanner-backend",
-        choices=["cli", "api"],
-        default="cli",
-        help="Use the ScanCode CLI or the in-process ScanCode Python API.",
-    )
-    scan_licenses.add_argument(
-        "--scancode-processes",
-        type=int,
-        default=1,
-        help=(
-            "Parallel processes used inside each ScanCode invocation. "
-            "Use 1 with many --workers to avoid oversubscription; ScanCode accepts 0 and -1 for its special modes."
-        ),
-    )
-    scan_licenses.add_argument("--batch-size", type=int, default=500)
-    scan_licenses.add_argument(
-        "--min-license-score",
-        type=float,
-        default=95.0,
-        help="Minimum ScanCode score for a match to count as a license hit. Matches the Stack v2 pipeline default.",
-    )
-    scan_licenses.add_argument(
-        "--min-match-coverage",
-        type=float,
-        default=95.0,
-        help="Minimum ScanCode match coverage for a match to count as a license hit. Matches the Stack v2 pipeline default.",
-    )
-    scan_licenses.add_argument(
-        "--progress-every",
-        type=int,
-        default=1000,
-        help="Emit a license scan progress log every N records.",
     )
 
     scan_hf_licenses = subparsers.add_parser(
@@ -475,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     encoding_benchmark.add_argument(
         "--text-field",
         default="opening_comment",
-        help="Input text column or JSON field to encode.",
+        help="Input Parquet text column to encode.",
     )
     encoding_benchmark.add_argument("--datasets", help="Comma-separated dataset directory names to include.")
     encoding_benchmark.add_argument("--languages", help="Comma-separated language directory names to include.")
@@ -631,12 +518,6 @@ def build_parser() -> argparse.ArgumentParser:
             "README config layout. 'language-splits' matches the published "
             "code-comments layout with one config per source dataset."
         ),
-    )
-    export_hf.add_argument(
-        "--format",
-        choices=["parquet", "jsonl"],
-        default="parquet",
-        help="Final shard format. Defaults to parquet for Hugging Face upload.",
     )
     export_hf.add_argument(
         "--overwrite",
@@ -852,17 +733,8 @@ def _build_source(
             source_kwargs["content_prefetch_records"] = content_prefetch_records
             source_kwargs["content_language_filter"] = content_language_filter
         return dataset, source_class(config, dataset, **source_kwargs)
-    if dataset.source == "url_list_jsonl":
-        return dataset, UrlListJsonlSource(
-            config,
-            dataset,
-            language=language,
-            show_progress=show_progress,
-            token=token,
-            max_files=max_files,
-        )
     raise ValueError(
-        f"Dataset '{dataset.name}' is not supported by the mining command yet"
+        f"Dataset '{dataset.name}' is not a supported Hugging Face source"
     )
 
 
@@ -928,40 +800,6 @@ def _mine_dataset(
     print(f"Comments written: {stats.comments_written}")
     print(f"Skipped without comment: {stats.skipped_without_comment}")
     print(f"Shards written: {stats.shards_written}")
-    return 0
-
-
-def _scan_comment_licenses(
-    input_directory: Path,
-    *,
-    output_directory: Path | None,
-    scancode: str,
-    scanner_backend: str,
-    scancode_processes: int,
-    batch_size: int,
-    min_license_score: float,
-    min_match_coverage: float,
-    progress_every: int,
-) -> int:
-    stats = scan_comment_licenses(
-        input_directory,
-        output_directory=output_directory,
-        scancode_command=scancode,
-        scanner_backend=scanner_backend,
-        scancode_processes=scancode_processes,
-        batch_size=batch_size,
-        min_license_score=min_license_score,
-        min_match_coverage=min_match_coverage,
-        progress_every=progress_every,
-    )
-    print(f"Input directory: {stats.input_directory}")
-    print(f"Output directory: {stats.output_directory}")
-    print(f"Records scanned: {stats.records_scanned}")
-    print(f"Records with detected license: {stats.records_with_detected_license}")
-    print(f"Records without detected license: {stats.records_without_detected_license}")
-    print(f"Shards processed: {stats.shards_processed}")
-    print(f"Shards skipped: {stats.shards_skipped}")
-    print(f"Batches run: {stats.batches_run}")
     return 0
 
 
@@ -1201,64 +1039,6 @@ def _benchmark_encoding_capacity(
     return 0
 
 
-def _aggregate_comment_runs(
-    input_directories: Sequence[Path],
-    *,
-    output_root: Path | None,
-    dataset_name: str,
-    source_field: str,
-    progress_every: int,
-) -> int:
-    stats = aggregate_comment_runs(
-        input_directories,
-        output_root=output_root,
-        dataset_name=dataset_name,
-        source_field=source_field,
-        progress_every=progress_every,
-    )
-    print(f"Dataset: {stats.dataset_name}")
-    print(f"Output directory: {stats.output_directory}")
-    print(f"Source datasets: {', '.join(stats.source_datasets)}")
-    print(f"Input runs: {len(stats.input_directories)}")
-    print(f"Records aggregated: {stats.records_aggregated}")
-    print(f"Shards written: {stats.shards_written}")
-    return 0
-
-
-def _deduplicate_comment_run(
-    input_directory: Path,
-    *,
-    output_root: Path | None,
-    dataset_name: str | None,
-    source_field: str,
-    hash_workers: int,
-    hash_batch_size: int,
-    sort_parallelism: int,
-    sort_command: str,
-    progress_every: int,
-) -> int:
-    stats = deduplicate_comment_run(
-        input_directory,
-        output_root=output_root,
-        dataset_name=dataset_name,
-        source_field=source_field,
-        hash_workers=hash_workers,
-        hash_batch_size=hash_batch_size,
-        sort_parallelism=sort_parallelism,
-        sort_command=sort_command,
-        progress_every=progress_every,
-    )
-    print(f"Input directory: {stats.input_directory}")
-    print(f"Input dataset: {stats.input_dataset_name}")
-    print(f"Dataset: {stats.dataset_name}")
-    print(f"Output directory: {stats.output_directory}")
-    print(f"Records seen: {stats.records_seen}")
-    print(f"Unique comments: {stats.unique_comments}")
-    print(f"Duplicate occurrences: {stats.duplicate_occurrences}")
-    print(f"Shards written: {stats.shards_written}")
-    return 0
-
-
 def _split_csv(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -1454,7 +1234,6 @@ def _export_hf_dataset(
     dedupe_record_ids: bool,
     dedupe_scope: str,
     dataset_card_layout: str,
-    output_format: str,
     overwrite: bool,
     max_records_per_shard: int | None,
     max_bytes_per_shard: int | None,
@@ -1472,7 +1251,6 @@ def _export_hf_dataset(
     stats = export_huggingface_dataset(
         source_directory,
         output_directory,
-        output_format=output_format,
         max_records_per_shard=max_records_per_shard or config.storage.max_records_per_shard,
         max_bytes_per_shard=max_bytes_per_shard or config.storage.max_bytes_per_shard,
         dedupe_record_ids=dedupe_record_ids,
@@ -1483,7 +1261,7 @@ def _export_hf_dataset(
     )
     print(f"Input directory: {source_directory}")
     print(f"Output directory: {stats.output_directory}")
-    print(f"Format: {output_format}")
+    print("Format: parquet")
     print(f"Records written: {stats.records_written}")
     print(f"Duplicates skipped: {stats.records_skipped_duplicate}")
     print(f"Dedupe scope: {dedupe_scope if dedupe_record_ids else 'none'}")
@@ -1546,38 +1324,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 extraction_workers=args.extraction_workers,
                 extraction_buffer=args.extraction_buffer,
                 cache_source_files=args.cache_source_files,
-                progress_every=args.progress_every,
-            )
-        if args.command == "aggregate-comment-runs":
-            return _aggregate_comment_runs(
-                args.input_directories,
-                output_root=args.output_root,
-                dataset_name=args.dataset_name,
-                source_field=args.source_field,
-                progress_every=args.progress_every,
-            )
-        if args.command == "deduplicate-comment-run":
-            return _deduplicate_comment_run(
-                args.input_directory,
-                output_root=args.output_root,
-                dataset_name=args.dataset_name,
-                source_field=args.source_field,
-                hash_workers=args.hash_workers,
-                hash_batch_size=args.hash_batch_size,
-                sort_parallelism=args.sort_parallelism,
-                sort_command=args.sort_command,
-                progress_every=args.progress_every,
-            )
-        if args.command == "scan-comment-licenses":
-            return _scan_comment_licenses(
-                args.input_directory,
-                output_directory=args.output_directory,
-                scancode=args.scancode,
-                scanner_backend=args.scanner_backend,
-                scancode_processes=args.scancode_processes,
-                batch_size=args.batch_size,
-                min_license_score=args.min_license_score,
-                min_match_coverage=args.min_match_coverage,
                 progress_every=args.progress_every,
             )
         if args.command == "scan-hf-comment-licenses":
@@ -1720,7 +1466,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dedupe_record_ids=args.dedupe_record_ids,
                 dedupe_scope=args.dedupe_scope,
                 dataset_card_layout=args.dataset_card_layout,
-                output_format=args.format,
                 overwrite=args.overwrite,
                 max_records_per_shard=args.max_records_per_shard,
                 max_bytes_per_shard=args.max_bytes_per_shard,

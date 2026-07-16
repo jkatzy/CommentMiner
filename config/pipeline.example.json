@@ -190,29 +190,6 @@
         "cache_source_files": false,
         "notes": "Public parquet dataset. Language names use dataset casing such as ANTLR, Python, C++, and C#."
       }
-    },
-    {
-      "name": "redpajama-github",
-      "source": "url_list_jsonl",
-      "repo_id": "togethercomputer/RedPajama-Data-1T",
-      "repo_type": "dataset",
-      "revision": "main",
-      "split": "train",
-      "streaming": true,
-      "enabled": true,
-      "batch_size": 1000,
-      "extra": {
-        "url_list_path": "urls/github.txt",
-        "content_columns": ["text"],
-        "language_columns": [],
-        "language_hint_columns": ["meta.language"],
-        "infer_language_from_path": true,
-        "path_columns": ["meta.path"],
-        "repo_columns": ["meta.repo_name"],
-        "extraction_workers": 4,
-        "extraction_buffer": 16,
-        "notes": "Streams RedPajama GitHub JSONL URLs directly; source JSONL files are not saved locally. meta.language is repo-level, so file language is inferred from meta.path."
-      }
     }
   ],
   "checkpoint_interval_records": 1000

@@ -1,9 +1,7 @@
 """CommentMiner package."""
 
-from .aggregation import AggregateCommentRunStats, aggregate_comment_runs
 from .config import DatasetSpec, PipelineConfig, StorageConfig
 from .downloader import DownloadPlan, DownloadSummary, HuggingFaceDownloader
-from .deduplication import DeduplicateCommentRunStats, deduplicate_comment_run
 from .encoding_benchmark import (
     EncodingCapacityStats,
     EncodingModelSpec,
@@ -16,7 +14,6 @@ from .license_scanner import (
     LicenseScoreHistogram,
     build_license_score_histogram,
     prewarm_huggingface_license_detection_cache,
-    scan_comment_licenses,
     scan_huggingface_comment_licenses,
 )
 from .models import CommentRecord, InputRecord
@@ -25,10 +22,8 @@ from .sources import ShardRowCursor, StackV2SWHContentSource, TheStackParquetSou
 from .topic_modelling import TopicModellingStats, run_low_scancode_topic_modelling
 
 __all__ = [
-    "AggregateCommentRunStats",
     "CommentRecord",
     "DatasetSpec",
-    "DeduplicateCommentRunStats",
     "DownloadPlan",
     "DownloadSummary",
     "EncodingCapacityStats",
@@ -46,13 +41,10 @@ __all__ = [
     "StorageConfig",
     "TheStackParquetSource",
     "TopicModellingStats",
-    "aggregate_comment_runs",
     "build_license_score_histogram",
-    "deduplicate_comment_run",
     "prewarm_huggingface_license_detection_cache",
     "run_encoding_capacity_benchmark",
     "run_dataset",
     "run_low_scancode_topic_modelling",
-    "scan_comment_licenses",
     "scan_huggingface_comment_licenses",
 ]
