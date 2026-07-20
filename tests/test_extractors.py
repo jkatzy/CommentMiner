@@ -22,6 +22,100 @@ class ExtractorTests(unittest.TestCase):
         self.assertEqual(match, "# header line\n# second line")
         self.assertIn("python", extractor._queries)
 
+    def test_ml4se_extractor_joins_line_comments_across_up_to_five_blank_lines(
+        self,
+    ) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+
+        separators = (
+            "\n\n",
+            "\n \t \n",
+            "\r\n\r\n",
+            "\r\n \t \r\n",
+            "\n" * 6,
+            "\n" + (" \t \n" * 5),
+            "\r\n" * 6,
+            "\r\n" + (" \t \r\n" * 5),
+        )
+        for separator in separators:
+            with self.subTest(separator=repr(separator)):
+                record = InputRecord(
+                    dataset="the-stack",
+                    record_id="r-blank-line",
+                    content=(
+                        "# first part\n"
+                        f"# first continuation{separator}"
+                        "# second part\n"
+                        "# second continuation\n"
+                        "print('x')\n"
+                    ),
+                    language="Python",
+                )
+
+                comments = extractor.extract_opening_comments(record)
+
+                self.assertEqual(len(comments), 1)
+                self.assertEqual(
+                    comments[0].text,
+                    (
+                        "# first part\n"
+                        f"# first continuation{separator}"
+                        "# second part\n"
+                        "# second continuation"
+                    ),
+                )
+
+    def test_ml4se_extractor_keeps_line_comments_separate_across_six_blank_lines(
+        self,
+    ) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+        record = InputRecord(
+            dataset="the-stack",
+            record_id="r-six-blank-lines",
+            content="# first part" + ("\n" * 7) + "# second part\nprint('x')\n",
+            language="Python",
+        )
+
+        comments = extractor.extract_opening_comments(record)
+
+        self.assertEqual(
+            [comment.text for comment in comments],
+            ["# first part", "# second part"],
+        )
+
+    def test_ml4se_extractor_only_joins_line_comments_across_blank_line(
+        self,
+    ) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+        cases = (
+            (
+                "block comments",
+                "/* first part */\n\n/* second part */\n",
+                ["/* first part */", "/* second part */"],
+            ),
+            (
+                "mixed comments",
+                "// first part\n\n/* second part */\n",
+                ["// first part", "/* second part */"],
+            ),
+        )
+
+        for name, content, expected in cases:
+            with self.subTest(name=name):
+                record = InputRecord(
+                    dataset="the-stack",
+                    record_id="r-non-line-blank",
+                    content=content,
+                    language="C",
+                )
+
+                comments = extractor.extract_opening_comments(record)
+
+                self.assertEqual(
+                    [comment.text for comment in comments],
+                    expected,
+                )
+
     def test_ml4se_extractor_resolves_common_extension_alias(self) -> None:
         extractor = ML4SEOpeningCommentExtractor()
         record = InputRecord(
@@ -83,11 +177,11 @@ class ExtractorTests(unittest.TestCase):
 
         self.assertEqual(
             [comment.text for comment in comments],
-            ["/* header */", "// inline detail", "// setup note"],
+            ["/* header */", "// inline detail\n\n// setup note"],
         )
         self.assertEqual(
             [comment.start_line for comment in comments],
-            [4, 5, 7],
+            [4, 5],
         )
 
     def test_ml4se_extractor_keeps_long_comment_that_starts_within_first_ten_lines(self) -> None:

@@ -5,7 +5,10 @@ from threading import Lock
 from typing import Any
 
 from ml4setk import OpeningCommentQuery, get_supported_comment_languages
-from ml4setk.Parsing.Comments.CommentQuery import _comment_start_ignored_ranges
+from ml4setk.Parsing.Comments.CommentQuery import (
+    CommentQuery,
+    _comment_start_ignored_ranges,
+)
 
 from .models import ExtractedComment, InputRecord
 
@@ -52,6 +55,8 @@ _LANGUAGE_ALIASES = {
     "zsh": "shell",
 }
 
+_MAX_LINE_COMMENT_BLANK_LINES = 5
+
 
 def _normalize_language_token(value: str) -> list[str]:
     token = value.strip().lower()
@@ -89,9 +94,34 @@ def _normalize_language_token(value: str) -> list[str]:
     return deduped
 
 
-def _comments_are_contiguous(text: str, previous_end: int, next_start: int) -> bool:
+def _comments_are_contiguous(
+    text: str,
+    previous_start: int,
+    previous_end: int,
+    next_start: int,
+    next_end: int,
+) -> bool:
+    """Return whether two comment ranges belong to the same logical block.
+
+    Preserve the existing adjacent-comment behavior, but allow up to five
+    blank lines between line comments that use the same delimiter family.
+    """
+
     between = text[previous_end:next_start]
-    return not between.strip() and between.count("\n") <= 1
+    if between.strip():
+        return False
+
+    line_breaks = between.count("\n")
+    if line_breaks <= 1:
+        return True
+    if line_breaks > _MAX_LINE_COMMENT_BLANK_LINES + 1:
+        return False
+
+    previous_key = CommentQuery._line_comment_group_key(
+        text[previous_start:previous_end]
+    )
+    next_key = CommentQuery._line_comment_group_key(text[next_start:next_end])
+    return previous_key is not None and previous_key == next_key
 
 
 def _opening_start_cutoff(text: str, max_start_row: int) -> int:
@@ -253,21 +283,25 @@ class ML4SEOpeningCommentExtractor:
         start_anchor = query._hashbang_end(record.content) if query.skip_hashbang else 0
         cutoff = _opening_start_cutoff(record.content, self.max_start_row)
         comment_ranges: list[tuple[int, int]] = []
+        previous_range: tuple[int, int] | None = None
         for start, end in _opening_comment_ranges_starting_before(
             query,
             record.content,
             start_anchor,
             cutoff,
         ):
-            if comment_ranges and _comments_are_contiguous(
+            if previous_range is not None and _comments_are_contiguous(
                 record.content,
-                comment_ranges[-1][1],
+                previous_range[0],
+                previous_range[1],
                 start,
+                end,
             ):
                 previous_start, _ = comment_ranges[-1]
                 comment_ranges[-1] = (previous_start, end)
             else:
                 comment_ranges.append((start, end))
+            previous_range = (start, end)
 
         comments: list[ExtractedComment] = []
         for start, end in comment_ranges:
