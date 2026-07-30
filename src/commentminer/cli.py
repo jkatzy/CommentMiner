@@ -26,6 +26,21 @@ from .license_scanner import (
 )
 from .logging_utils import configure_logging
 from .pipeline import run_dataset
+from .redistribution_candidates import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_DATASET,
+    DEFAULT_FUZZY_THRESHOLD,
+    DEFAULT_INPUT_SOURCE,
+    DEFAULT_LANGUAGE,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_REVISION,
+    DEFAULT_SOURCE_FILES_LIMIT,
+    JUDGMENT_PROFILE_REDISTRIBUTION_INTENT,
+    JUDGMENT_PROFILES,
+    build_redistribution_candidates,
+    verify_redistribution_candidates,
+)
+from .redistribution_judge import SUPPORTED_REASONING_EFFORTS
 from .sources import HuggingFaceParquetSource, StackV2SWHContentSource
 from .stackv2_packages import mine_stack_v2_id_packages
 from .topic_modelling import run_low_scancode_topic_modelling
@@ -337,6 +352,217 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete an existing output directory before writing topic modelling output.",
     )
+
+    redistribution_candidates = subparsers.add_parser(
+        "build-redistribution-candidate-dataset",
+        help=(
+            "Fuzzy-match seed phrases in a bounded comment slice and optionally "
+            "judge every candidate for redistribution intent."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "output_directory",
+        type=Path,
+        help="New directory for candidate, occurrence, judge, and manifest artifacts.",
+    )
+    redistribution_candidates.add_argument(
+        "--input-source",
+        default=DEFAULT_INPUT_SOURCE,
+        help="Local Hugging Face-style Parquet root or Hugging Face dataset ID.",
+    )
+    redistribution_candidates.add_argument(
+        "--dataset",
+        default=DEFAULT_DATASET,
+        help="Dataset configuration/directory to select.",
+    )
+    redistribution_candidates.add_argument(
+        "--language",
+        default=DEFAULT_LANGUAGE,
+        help="Language split/directory to select.",
+    )
+    redistribution_candidates.add_argument(
+        "--source-files-limit",
+        type=int,
+        default=DEFAULT_SOURCE_FILES_LIMIT,
+        help=(
+            "Keep comments belonging to the first N original source-file rows; "
+            "this is not a comment-row limit."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--all-languages",
+        action="store_true",
+        help=(
+            "Build a deterministic max-min-balanced sample across every local "
+            "language partition instead of a single source-file prefix."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--comment-rows-limit",
+        type=int,
+        help="Exact eligible comment-row sample size for --all-languages.",
+    )
+    redistribution_candidates.add_argument(
+        "--scancode-score-below",
+        dest="scancode_score_threshold",
+        type=float,
+        help=(
+            "Strict ScanCode score ceiling for --all-languages; values <=1 "
+            "are normalized to the native 0-100 scale."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--scan-workers",
+        type=int,
+        default=1,
+        help="Parallel Parquet inventory and fuzzy-scan workers.",
+    )
+    redistribution_candidates.add_argument(
+        "--fuzzy-threshold",
+        type=float,
+        default=DEFAULT_FUZZY_THRESHOLD,
+        help="Minimum formatting-tolerant seed similarity on a 0-1 scale.",
+    )
+    redistribution_candidates.add_argument(
+        "--include-government-seeds",
+        action="store_true",
+        help="Extend the 126 core seed phrases with the separate government-restriction seeds.",
+    )
+    redistribution_candidates.add_argument(
+        "--include-provenance-seeds",
+        action="store_true",
+        help=(
+            "Add proprietary-code provenance, decompilation, reconstruction, "
+            "and possible unauthorized-exposure seed phrases."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--include-funding-seeds",
+        action="store_true",
+        help=(
+            "Add project-funding, sponsorship, publication-review, and "
+            "funding-linked dissemination seed phrases."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--include-export-control-seeds",
+        action="store_true",
+        help=(
+            "Add export-control barriers, regulations, classifications, "
+            "and public-release exception seed phrases."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--include-unpublished-work-seeds",
+        action="store_true",
+        help=(
+            "Add source-code nonpublication, unpublished-work, and "
+            "no-intent-to-publish seed phrases."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Write the fuzzy-match candidate dataset without invoking Codex judges.",
+    )
+    redistribution_candidates.add_argument(
+        "--judgment-profile",
+        choices=JUDGMENT_PROFILES,
+        default=JUDGMENT_PROFILE_REDISTRIBUTION_INTENT,
+        help=(
+            "Use the legacy broad redistribution-intent rubric or independently "
+            "judge non-license limitations and license text."
+        ),
+    )
+    redistribution_candidates.add_argument(
+        "--batch-size",
+        type=int,
+        default=8192,
+        help="Rows per input Parquet scan batch.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-batch-size",
+        type=int,
+        default=64,
+        help="Candidates submitted in each Codex judge request.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-workers",
+        type=int,
+        default=4,
+        help="Concurrent Codex judge requests.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-max-batch-chars",
+        type=int,
+        default=160_000,
+        help="Maximum serialized comment characters in one judge request.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-max-comment-chars",
+        type=int,
+        default=12_000,
+        help="Maximum characters from one comment sent to the judge.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-max-attempts",
+        type=int,
+        default=3,
+        help="Maximum attempts for each malformed or failed judge batch.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-timeout-seconds",
+        type=float,
+        default=900.0,
+        help="Timeout in seconds for each Codex judge attempt.",
+    )
+    redistribution_candidates.add_argument(
+        "--judge-cache",
+        type=Path,
+        help="Persistent SQLite decision cache; defaults beside the output directory.",
+    )
+    redistribution_candidates.add_argument(
+        "--revision",
+        default=DEFAULT_REVISION,
+        help="Hugging Face dataset revision for remote input.",
+    )
+    redistribution_candidates.add_argument(
+        "--token-env",
+        help="Environment variable containing a Hugging Face token.",
+    )
+    redistribution_candidates.add_argument(
+        "--hf-cache-directory",
+        type=Path,
+        help="Optional Hugging Face snapshot cache directory.",
+    )
+    redistribution_candidates.add_argument(
+        "--codex-command",
+        default="codex",
+        help="Codex executable or command prefix.",
+    )
+    redistribution_candidates.add_argument(
+        "--codex-model",
+        choices=[DEFAULT_CODEX_MODEL],
+        default=DEFAULT_CODEX_MODEL,
+        help="Pinned judge model (fixed for this dataset workflow).",
+    )
+    redistribution_candidates.add_argument(
+        "--codex-reasoning-effort",
+        choices=SUPPORTED_REASONING_EFFORTS,
+        default=DEFAULT_REASONING_EFFORT,
+        help="Codex reasoning effort; max remains the reproducible default.",
+    )
+    redistribution_candidates.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Atomically replace a recognizable prior redistribution-candidate output.",
+    )
+
+    verify_redistribution = subparsers.add_parser(
+        "verify-redistribution-candidate-dataset",
+        help="Verify candidate provenance, judgments, schema, and artifact hashes.",
+    )
+    verify_redistribution.add_argument("output_directory", type=Path)
 
     encoding_benchmark = subparsers.add_parser(
         "benchmark-encoding-capacity",
@@ -1051,6 +1277,122 @@ def _split_int_csv(value: str | None) -> list[int] | None:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def _build_redistribution_candidate_dataset_command(
+    output_directory: Path,
+    *,
+    input_source: str,
+    dataset: str,
+    language: str,
+    source_files_limit: int,
+    all_languages: bool,
+    comment_rows_limit: int | None,
+    scancode_score_threshold: float | None,
+    scan_workers: int,
+    fuzzy_threshold: float,
+    include_government_seeds: bool,
+    include_provenance_seeds: bool,
+    include_funding_seeds: bool,
+    include_export_control_seeds: bool,
+    include_unpublished_work_seeds: bool,
+    scan_only: bool,
+    batch_size: int,
+    judge_batch_size: int,
+    judge_workers: int,
+    judge_max_batch_chars: int,
+    judge_max_comment_chars: int,
+    judge_max_attempts: int,
+    judge_timeout_seconds: float,
+    judge_cache: Path | None,
+    revision: str,
+    token_env: str | None,
+    hf_cache_directory: Path | None,
+    codex_command: str,
+    codex_model: str,
+    codex_reasoning_effort: str,
+    judgment_profile: str,
+    overwrite: bool,
+) -> int:
+    stats = build_redistribution_candidates(
+        output_directory,
+        input_source=input_source,
+        dataset=dataset,
+        language=language,
+        source_files_limit=source_files_limit,
+        all_languages=all_languages,
+        comment_rows_limit=comment_rows_limit,
+        scancode_score_threshold=scancode_score_threshold,
+        scan_workers=scan_workers,
+        fuzzy_threshold=fuzzy_threshold,
+        include_government_seeds=include_government_seeds,
+        include_provenance_seeds=include_provenance_seeds,
+        include_funding_seeds=include_funding_seeds,
+        include_export_control_seeds=include_export_control_seeds,
+        include_unpublished_work_seeds=include_unpublished_work_seeds,
+        scan_only=scan_only,
+        batch_size=batch_size,
+        judge_batch_size=judge_batch_size,
+        judge_workers=judge_workers,
+        judge_max_batch_chars=judge_max_batch_chars,
+        judge_max_comment_chars=judge_max_comment_chars,
+        judge_max_attempts=judge_max_attempts,
+        judge_timeout_seconds=judge_timeout_seconds,
+        judge_cache_path=judge_cache,
+        revision=revision,
+        hf_token=_resolve_token(token_env),
+        hf_cache_directory=hf_cache_directory,
+        codex_command=codex_command,
+        codex_model=codex_model,
+        reasoning_effort=codex_reasoning_effort,
+        judgment_profile=judgment_profile,
+        overwrite=overwrite,
+    )
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Input format: {stats.input_format}")
+    if stats.selection_mode == "stratified_comment_rows":
+        print(f"Languages in scope: {stats.languages_in_scope}")
+        print(f"Eligible comment rows sampled: {stats.comment_rows_in_scope}")
+    else:
+        print(f"Original source files in scope: {stats.source_files_in_scope}")
+    print(f"Comment-bearing source files seen: {stats.comment_bearing_files_seen}")
+    print(f"Comment rows seen: {stats.comment_rows_seen}")
+    print(f"Shards scanned: {stats.shards_scanned}")
+    print(f"Matched seed occurrences: {stats.matched_occurrences}")
+    print(f"Unique candidates: {stats.candidate_count}")
+    print(f"Occurrence table: {stats.occurrences_path}")
+    print(f"Candidate table: {stats.candidates_path}")
+    if stats.scan_only:
+        print("Judge mode: scan only")
+        print(f"Manifest: {stats.manifest_path}")
+        print(f"Verification: {stats.verification_path}")
+        return 0
+    print(f"Candidates judged: {stats.judged_count}")
+    print(f"Judge batches: {stats.judge_batches}")
+    print(f"Judge attempts: {stats.judge_attempts}")
+    print(f"Judge cache hits: {stats.judge_cache_hits}")
+    print(f"Judged candidate dataset: {stats.dataset_path}")
+    print(f"Labeled occurrence dataset: {stats.labeled_occurrences_path}")
+    if stats.non_license_limitations_path is not None:
+        print(f"Non-license limitations: {stats.non_license_limitations_path}")
+    if stats.scancode_missed_licenses_path is not None:
+        print(f"ScanCode-missed licenses: {stats.scancode_missed_licenses_path}")
+    print(f"Manifest: {stats.manifest_path}")
+    print(f"Verification: {stats.verification_path}")
+    return 0
+
+
+def _verify_redistribution_candidate_dataset_command(
+    output_directory: Path,
+) -> int:
+    report = verify_redistribution_candidates(output_directory)
+    print(f"Valid: {report.valid}")
+    print(f"Candidates: {report.candidate_count}")
+    print(f"Matched occurrences: {report.matched_occurrences}")
+    print(f"Judged candidates: {report.judged_count}")
+    for error in report.errors:
+        print(f"- {error}")
+    return 0 if report.valid else 1
+
+
 def _mine_config(
     config_path: Path,
     *,
@@ -1390,6 +1732,49 @@ def main(argv: Sequence[str] | None = None) -> int:
                 judge_sample_size=args.judge_sample_size,
                 judge_max_topics=args.judge_max_topics,
                 overwrite=args.overwrite,
+            )
+        if args.command == "build-redistribution-candidate-dataset":
+            return _build_redistribution_candidate_dataset_command(
+                args.output_directory,
+                input_source=args.input_source,
+                dataset=args.dataset,
+                language=args.language,
+                source_files_limit=args.source_files_limit,
+                all_languages=args.all_languages,
+                comment_rows_limit=args.comment_rows_limit,
+                scancode_score_threshold=args.scancode_score_threshold,
+                scan_workers=args.scan_workers,
+                fuzzy_threshold=args.fuzzy_threshold,
+                include_government_seeds=args.include_government_seeds,
+                include_provenance_seeds=args.include_provenance_seeds,
+                include_funding_seeds=args.include_funding_seeds,
+                include_export_control_seeds=(
+                    args.include_export_control_seeds
+                ),
+                include_unpublished_work_seeds=(
+                    args.include_unpublished_work_seeds
+                ),
+                scan_only=args.scan_only,
+                batch_size=args.batch_size,
+                judge_batch_size=args.judge_batch_size,
+                judge_workers=args.judge_workers,
+                judge_max_batch_chars=args.judge_max_batch_chars,
+                judge_max_comment_chars=args.judge_max_comment_chars,
+                judge_max_attempts=args.judge_max_attempts,
+                judge_timeout_seconds=args.judge_timeout_seconds,
+                judge_cache=args.judge_cache,
+                revision=args.revision,
+                token_env=args.token_env,
+                hf_cache_directory=args.hf_cache_directory,
+                codex_command=args.codex_command,
+                codex_model=args.codex_model,
+                codex_reasoning_effort=args.codex_reasoning_effort,
+                judgment_profile=args.judgment_profile,
+                overwrite=args.overwrite,
+            )
+        if args.command == "verify-redistribution-candidate-dataset":
+            return _verify_redistribution_candidate_dataset_command(
+                args.output_directory,
             )
         if args.command == "benchmark-encoding-capacity":
             return _benchmark_encoding_capacity(

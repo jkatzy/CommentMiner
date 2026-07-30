@@ -19,7 +19,9 @@ JSON files are control artifacts only: configuration, checkpoints, manifests, an
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/) for dependency and command execution
 - A Hugging Face token for gated datasets such as The Stack, The Stack v2, and StarCoderData
-- The Codex CLI only for optional topic-cluster validation
+- The Codex CLI, authenticated and able to access the configured model, for
+  redistribution-candidate judging; it remains optional for topic-cluster
+  validation
 
 Install all dependencies, including ScanCode Toolkit, BERTopic, and SentenceTransformers:
 
@@ -294,6 +296,131 @@ The sibling output directory can contain:
 
 Codex validation excludes BERTopic's `-1` outlier topic.
 
+### Redistribution-intent candidate dataset
+
+`build-redistribution-candidate-dataset` uses the 126 `SEED_TOPICS` phrases as
+formatting-tolerant fuzzy retrieval signals, preserves every matched occurrence,
+and judges each unique candidate as redistribution intent, another meaning, or
+ambiguous. The separate government-specific seeds are opt-in. Retrieval scores
+and matched phrases are audit metadata, not labels. Ordinary open-source
+license grants and redistribution clauses count as code redistribution intent;
+technical uses such as data distributions and shared memory do not.
+
+Four more opt-in retrieval families broaden coverage for proprietary
+provenance (including decompiler/reconstruction signals), funding-linked
+dissemination conditions, export controls, and code-specific unpublished-work
+notices. Enable them with
+`--include-provenance-seeds`, `--include-funding-seeds`, and
+`--include-export-control-seeds`, and `--include-unpublished-work-seeds`,
+respectively. The families contain 24, 24, 37, and 30 phrases, taking the
+effective inventory from 126 to 238 after exact tokenized overlaps are
+deduplicated. These are candidate-generation signals only: they do not prove
+theft, an unauthorized leak, a funding barrier, or an export-control violation,
+and they do not assign a judge label.
+
+Run the requested bounded preset against `Jkatzy/code-comments`:
+
+```bash
+scripts/run-redistribution-candidate-dataset.sh
+```
+
+It selects `the-stack-v2-dedup` / `Java` and the first 100,000 original
+source-file rows—not 100,000 comment rows—then uses batches of 64 across four
+parallel judges. The judge is fixed to `gpt-5.6-luna` with `max` reasoning.
+The source revision is pinned to
+`0d4c83fac76705d2e2388186b628543a4916dab8`.
+Use `SCAN_ONLY=1` to materialize fuzzy candidates without model calls; use a
+different `OUTPUT` for that preview so the judged dataset remains separate.
+The preset exposes the expanded families as `INCLUDE_PROVENANCE_SEEDS=1`,
+`INCLUDE_FUNDING_SEEDS=1`, `INCLUDE_EXPORT_CONTROL_SEEDS=1`, and
+`INCLUDE_UNPUBLISHED_WORK_SEEDS=1`. For example:
+
+```bash
+SCAN_ONLY=1 \
+INCLUDE_GOVERNMENT_SEEDS=1 \
+INCLUDE_PROVENANCE_SEEDS=1 \
+INCLUDE_FUNDING_SEEDS=1 \
+INCLUDE_EXPORT_CONTROL_SEEDS=1 \
+INCLUDE_UNPUBLISHED_WORK_SEEDS=1 \
+OUTPUT=var/redistribution-candidate-comments-java-100k-expanded-scan \
+scripts/run-redistribution-candidate-dataset.sh
+```
+
+The existing 709-candidate, 1,210-occurrence artifact is unchanged and remains
+the reproducible 126-seed baseline. The expanded scan must use its own output
+directory; compare the `results` counts and seed inventory in each manifest.
+On the identical Java 100,000-file prefix, enabling all families produced 882
+candidates and 1,688 occurrences. The unpublished-work family identified 15
+occurrences across 14 comments and added one candidate missed by the previous
+224-seed expansion.
+
+The materialized run contains 1,210 matched occurrences, 709 unique judged
+comments, 701 redistribution-intent labels, and 8 `other` labels; its
+`verification.json` report is valid with no errors.
+
+For the narrower target—opening comments that impose a redistribution or
+sharing limitation independently of a license—run:
+
+```bash
+scripts/run-non-license-redistribution-limitations-java-100k.sh
+```
+
+That profile judges non-license limitations and genuine license text as
+independent facts. It writes `non-license-limitations.parquet` plus
+`scancode-missed-licenses.parquet`, where a miss means the judge found license
+text but ScanCode's structured `contains_license_notice` result was false.
+License-only redistribution clauses are excluded from the positive limitation
+subset. The preset uses four parallel `gpt-5.6-luna` judges at `max` reasoning
+and publishes to a separate output directory.
+
+The current v3 judge requires evidence of an external recipient,
+dissemination, permission, confidentiality, owner-permission, publication, or
+release boundary. Within-project reuse guidance—such as “do not copy/paste this
+configuration,” browser/source-view instructions, refactoring reminders, or
+warnings not to imitate bad code—is not a redistribution limitation.
+Attribution or plagiarism advice alone is also excluded. A bare “do not copy”
+without enough context is `ambiguous`, not automatically positive. The v3
+prompt identity prevents older cached decisions from being silently reused.
+
+The historical v1 materialized profile contains 111 non-license limitations
+and 104 ScanCode-missed licenses among the 709 candidates. The missed set
+contains 39 named-family judgments and 65 custom/unnamed license notices. See
+the detailed dataset document for the family counts and score distribution.
+
+For broad language coverage, run:
+
+```bash
+scripts/run-non-license-redistribution-limitations-stack-v2-all-languages-5m.sh
+```
+
+This preset selects exactly 5,000,000 comments with normalized ScanCode score
+below `0.9` (raw score `<90`) across all 598 local Stack v2 languages. It uses
+max-min language allocation, systematic within-language sampling, the complete
+251-seed inventory, 32 scan workers, and eight parallel `gpt-5.6-luna` judges
+at `low` reasoning. The Java presets retain their existing `max` default.
+
+The completed verified run examined 344,269,908 comments in 4,492 shards,
+found 322,393,555 below the strict score ceiling, and selected exactly
+5,000,000. Fuzzy retrieval produced 38,461 occurrences and 25,921 unique
+candidates. Its v2 labels were 11,130 `other`, 8,078 `license_only`, 6,338
+`non_license_redistribution_limitation`, 250 mixed limitation-plus-license, and
+125 `ambiguous`. The two filtered views contain 6,592 candidate limitations
+and 8,328 ScanCode-missed licenses.
+
+Those materialized labels predate the v3 within-project copy/paste correction
+described above. They remain an auditable v2 artifact, but should be rejudged
+with the new prompt before the positive subset is treated as corrected.
+
+Verify an end-to-end output independently:
+
+```bash
+uv run commentminer verify-redistribution-candidate-dataset \
+  var/redistribution-candidate-comments-java-100k
+```
+
+See [`docs/redistribution-candidates.md`](docs/redistribution-candidates.md)
+for the sampling semantics, labels, explicit CLI, and preset overrides.
+
 ### Encoder capacity benchmark
 
 Benchmark SentenceTransformer-compatible encoders against scored Parquet input:
@@ -355,5 +482,6 @@ Implemented and covered by tests:
 - Parquet ScanCode scoring with API and CLI backends
 - exact-comment caching, configuration-aware checkpoints, and score histograms
 - Parquet-based topic modelling and encoder benchmarking
+- formatting-tolerant seed retrieval and parallel redistribution-intent judging
 
 Archive-based and other non-Hugging-Face sources are intentionally unsupported. Long-running jobs should retain the default `INFO` logging or set another level with the global `--log-level` option.
