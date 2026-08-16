@@ -191,6 +191,44 @@ class HuggingFaceDownloaderTests(unittest.TestCase):
             self.assertEqual(python_plan.matched_count, 1)
             self.assertEqual(java_plan.matched_count, 1)
 
+    def test_plan_download_partitions_a_bounded_file_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                ),
+                datasets=[],
+            )
+            dataset = DatasetSpec(
+                name="code-clippy-github",
+                repo_id="CodedotAI/code_clippy_github",
+                allow_patterns=["*.json.gz"],
+                extra={
+                    "file_start_at": "shard-0002.json.gz",
+                    "file_stop_at": "shard-0007.json.gz",
+                    "file_partition_count": 2,
+                    "file_partition_index": 1,
+                },
+            )
+            config.datasets.append(dataset)
+            downloader = HuggingFaceDownloader(
+                api=FakeApi(
+                    [FakeRepoFile(f"shard-{index:04d}.json.gz", 10) for index in range(10)]
+                )
+            )
+
+            plan = downloader.plan_download(config, dataset)
+
+            self.assertEqual(
+                [remote.path for remote in plan.pending_files],
+                ["shard-0003.json.gz", "shard-0005.json.gz", "shard-0007.json.gz"],
+            )
+
     def test_download_writes_files_and_updates_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

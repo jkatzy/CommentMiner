@@ -26,5 +26,8 @@ coverage/
 
 # Generated artifacts
 data/
+!src/commentminer/data/
+!src/commentminer/data/**
+!src/commentminer/data/langs_extension.json
 var/
 *.log

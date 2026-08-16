@@ -65,7 +65,18 @@ def write_comment_records(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def estimated_record_bytes(record: dict[str, Any]) -> int:
-    return len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    """Estimate logical record bytes without serializing the record to JSON.
+
+    Normalized comment records contain only strings and nulls. The fixed allowance
+    covers JSON field names and syntax, while the 12.5% margin covers common string
+    escaping. This remains intentionally conservative because it is only used to
+    rotate output shards, not to report their actual Parquet size.
+    """
+    value_bytes = sum(
+        len(value.encode("utf-8")) if isinstance(value, str) else 4
+        for value in record.values()
+    )
+    return 192 + value_bytes + value_bytes // 8
 
 
 def _string_or_none(value: Any) -> str | None:

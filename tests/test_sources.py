@@ -11,10 +11,14 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import zstandard
 
 from commentminer.config import DatasetSpec, PipelineConfig, StorageConfig
 from commentminer.downloader import HuggingFaceDownloader
 from commentminer.sources import (
+    HuggingFaceGzipJsonlSource,
+    PileGitHubZstdJsonlSource,
+    RedPajamaV1GitHubSource,
     ShardRowCursor,
     SoftwareHeritageS3ContentFetcher,
     StackV2SWHContentSource,
@@ -116,6 +120,232 @@ class FakeStackV2ContentFetcher:
 
 
 class TheStackParquetSourceTests(unittest.TestCase):
+    def test_file_partition_has_isolated_run_and_checkpoint_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                ),
+                datasets=[],
+            )
+            dataset = DatasetSpec(
+                name="the-stack",
+                repo_id="bigcode/the-stack",
+                extra={"file_partition_count": 32, "file_partition_index": 7},
+            )
+
+            source = TheStackParquetSource(
+                config,
+                dataset,
+                language="python",
+                show_progress=False,
+            )
+
+            self.assertEqual(source.name, "the-stack__python__part-00007-of-00032")
+            self.assertEqual(
+                source.processed_checkpoint_namespace,
+                "processed-shards-part-00007-of-00032",
+            )
+
+            cplusplus_source = TheStackParquetSource(
+                config,
+                dataset,
+                language="c++",
+                show_progress=False,
+            )
+            self.assertEqual(
+                cplusplus_source.name,
+                "the-stack__c++__lang-cedb1bac__part-00007-of-00032",
+            )
+            self.assertEqual(
+                cplusplus_source.processed_checkpoint_namespace,
+                "processed-shards-lang-cedb1bac-part-00007-of-00032",
+            )
+
+    def test_gzip_jsonl_source_maps_configured_columns_and_path_extension(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fixture_path = root / "github-dedup-000.json.gz"
+            with gzip.open(fixture_path, mode="wt", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "content": "// header\nconst value = 1;\n",
+                            "repo_name": "example/project",
+                            "path": "src/value.js",
+                            "license": "mit",
+                        }
+                    )
+                    + "\n"
+                )
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                ),
+                datasets=[],
+            )
+            dataset = DatasetSpec(
+                name="code-clippy-github",
+                repo_id="CodedotAI/code_clippy_github",
+                extra={
+                    "source_format": "gzip_jsonl",
+                    "content_columns": ["content", "code_text"],
+                    "language_columns": ["language"],
+                    "path_columns": ["path", "file_path"],
+                    "repo_columns": ["repo_name"],
+                },
+            )
+            source = HuggingFaceGzipJsonlSource(
+                config,
+                dataset,
+                show_progress=False,
+            )
+
+            records = list(
+                source._iter_file_records(
+                    FakeRepoFile(
+                        "github-dedup-000.json.gz",
+                        fixture_path.stat().st_size,
+                    ),
+                    fixture_path,
+                    None,
+                )
+            )
+
+            self.assertEqual(len(records), 1)
+            self.assertIsNone(records[0].language)
+            self.assertEqual(records[0].path, "src/value.js")
+            self.assertEqual(records[0].repo, "example/project")
+            self.assertEqual(records[0].metadata["ext"], "js")
+            self.assertNotIn("content", records[0].metadata)
+
+    def test_pile_source_reads_only_github_records_from_zstd_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fixture_path = root / "train.jsonl.zst"
+            rows = [
+                {"text": "web text", "meta": {"pile_set_name": "Pile-CC"}},
+                {
+                    "text": "# header\nprint('ok')\n",
+                    "meta": {"pile_set_name": "Github"},
+                },
+                {"text": "paper", "meta": {"pile_set_name": "ArXiv"}},
+            ]
+            with (
+                fixture_path.open("wb") as raw,
+                zstandard.ZstdCompressor().stream_writer(raw) as compressed,
+            ):
+                for row in rows:
+                    compressed.write((json.dumps(row) + "\n").encode())
+
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                ),
+                datasets=[],
+            )
+            dataset = DatasetSpec(
+                name="pile-uncopyrighted-github",
+                repo_id="monology/pile-uncopyrighted",
+                extra={"source_format": "pile_github_zstd_jsonl"},
+            )
+            source = PileGitHubZstdJsonlSource(
+                config,
+                dataset,
+                show_progress=False,
+            )
+
+            records = list(
+                source._iter_file_records(
+                    FakeRepoFile("train/00.jsonl.zst", fixture_path.stat().st_size),
+                    fixture_path,
+                    None,
+                )
+            )
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                records[0].record_id,
+                "train/00.jsonl.zst::row::1",
+            )
+            self.assertEqual(records[0].content, "# header\nprint('ok')\n")
+            self.assertTrue(records[0].metadata["detect_language_from_content"])
+
+    def test_redpajama_v1_github_maps_nested_metadata_and_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = PipelineConfig(
+                storage=StorageConfig(
+                    working_directory=root / "work",
+                    output_directory=root / "output",
+                    checkpoint_directory=root / "checkpoints",
+                    download_directory=root / "downloads",
+                    huggingface_cache_directory=root / "hf-cache",
+                ),
+                datasets=[],
+            )
+            dataset = DatasetSpec(
+                name="redpajama-v1-github",
+                repo_id="togethercomputer/RedPajama-Data-1T",
+                extra={"source_format": "redpajama_v1_github"},
+            )
+            source = RedPajamaV1GitHubSource(
+                config,
+                dataset,
+                show_progress=False,
+                manifest_urls=["https://data.example/github/part-000.jsonl"],
+            )
+
+            record = source._row_to_input_record(
+                "github/part-000.jsonl",
+                7,
+                {
+                    "text": "# Copyright\nprint('ok')\n",
+                    "meta": {
+                        "source": "github",
+                        "repo_name": "example/project",
+                        "path": "src/tool.py",
+                        "license": "apache-2.0",
+                    },
+                },
+            )
+
+            self.assertEqual(
+                record.record_id,
+                "github/part-000.jsonl::row::7",
+            )
+            self.assertEqual(record.content, "# Copyright\nprint('ok')\n")
+            self.assertIsNone(record.language)
+            self.assertEqual(record.path, "src/tool.py")
+            self.assertEqual(record.repo, "example/project")
+            self.assertEqual(record.metadata["ext"], "py")
+            self.assertEqual(record.metadata["license"], "apache-2.0")
+            self.assertEqual(record.metadata["red_pajama_subset"], "github")
+
+    def test_redpajama_v1_github_remote_path_uses_manifest_filename(self) -> None:
+        self.assertEqual(
+            RedPajamaV1GitHubSource._remote_path(
+                "https://data.together.xyz/v1/github/shard.sampled.jsonl"
+            ),
+            "github/shard.sampled.jsonl",
+        )
+
     def test_source_streams_rows_and_deletes_processed_shard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

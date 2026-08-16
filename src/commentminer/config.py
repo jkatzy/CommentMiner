@@ -227,13 +227,15 @@ class PipelineConfig:
         base_dir: Path,
     ) -> "PipelineConfig":
         datasets = [DatasetSpec.from_dict(item) for item in data.get("datasets", [])]
+        supported_sources = {"huggingface_hub", "huggingface_bucket"}
         unsupported_sources = sorted(
-            {dataset.source for dataset in datasets if dataset.source != "huggingface_hub"}
+            {dataset.source for dataset in datasets if dataset.source not in supported_sources}
         )
         if unsupported_sources:
             joined = ", ".join(unsupported_sources)
             raise ValueError(
-                "CommentMiner supports Hugging Face dataset sources only; "
+                "CommentMiner supports Hugging Face dataset sources only "
+                "(regular repositories and Storage Buckets); "
                 f"unsupported source values: {joined}"
             )
         checkpoint_interval_records = _require_positive_int(

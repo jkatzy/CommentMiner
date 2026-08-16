@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
+from importlib import resources
+import json
 from threading import Lock
 from typing import Any
 
@@ -9,11 +12,33 @@ from ml4setk.Parsing.Comments.CommentQuery import (
     CommentQuery,
     _comment_start_ignored_ranges,
 )
+from ml4setk.Parsing.Comments import get_comment_syntax
+from pygments.lexers import guess_lexer
+from pygments.util import ClassNotFound
 
 from .models import ExtractedComment, InputRecord
 
 
 _LANGUAGE_ALIASES = {
+    "c-objdump": "assembly",
+    "cpp-objdump": "assembly",
+    "d-objdump": "assembly",
+    "genero 4gl": "genero",
+    "genero per": "genero_forms",
+    "go checksums": "checksums",
+    "jai": "c++",
+    "linux kernel module": "c",
+    "microsoft developer studio project": "microsoft_visual_studio_solution",
+    "nu": "nushell",
+    "objdump": "assembly",
+    "oberon": "mathematica",
+    "pkl": "java",
+    "quickbasic": "basic",
+    "spline font database": "python",
+    "ston": "smalltalk",
+    "sweave": "r",
+    "tl-verilog": "verilog",
+    "unity3d asset": "yaml",
     "bash": "shell",
     "c#": "csharp",
     "c-sharp": "c#",
@@ -58,6 +83,27 @@ _LANGUAGE_ALIASES = {
 _MAX_LINE_COMMENT_BLANK_LINES = 5
 
 
+@lru_cache(maxsize=1)
+def _forge_extension_languages() -> dict[str, tuple[str, ...]]:
+    payload = json.loads(
+        resources.files("commentminer")
+        .joinpath("data/langs_extension.json")
+        .read_text(encoding="utf-8")
+    )
+    mapping: dict[str, list[str]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        for raw_extension in item.get("extensions") or []:
+            extension = str(raw_extension).strip().lower().lstrip(".")
+            if extension and name not in mapping.setdefault(extension, []):
+                mapping[extension].append(name)
+    return {extension: tuple(names) for extension, names in mapping.items()}
+
+
 def _normalize_language_token(value: str) -> list[str]:
     token = value.strip().lower()
     if not token:
@@ -92,6 +138,36 @@ def _normalize_language_token(value: str) -> list[str]:
             deduped.append(candidate)
             seen.add(candidate)
     return deduped
+
+
+def _content_language_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    try:
+        lexer = guess_lexer(text[:64_000])
+    except ClassNotFound:
+        pass
+    else:
+        candidates.append(lexer.name)
+        candidates.extend(lexer.aliases)
+
+    opening = text.lstrip("\ufeff \t\r\n")[:16].lower()
+    prefix_languages = (
+        ("<!--", ("HTML", "XML")),
+        ("/*", ("C", "C++", "Java", "JavaScript")),
+        ("//", ("C", "C++", "Java", "JavaScript")),
+        ("(*", ("OCaml", "Pascal", "Mathematica")),
+        ("--", ("SQL", "Haskell", "Ada")),
+        ("#", ("Python", "Shell")),
+        ("%", ("TeX", "Matlab", "Prolog")),
+        (";", ("Assembly", "Lisp", "INI")),
+        ("rem ", ("Basic", "Batchfile")),
+        ("'", ("Visual Basic",)),
+    )
+    for prefix, languages in prefix_languages:
+        if opening.startswith(prefix):
+            candidates.extend(languages)
+            break
+    return candidates
 
 
 def _comments_are_contiguous(
@@ -275,76 +351,96 @@ class ML4SEOpeningCommentExtractor:
         if not record.content:
             return []
 
-        language = self._resolve_language(record)
-        if language is None:
+        languages = self._resolve_languages(record)
+        if not languages:
             return []
 
-        query = self._query_for_language(language)
-        start_anchor = query._hashbang_end(record.content) if query.skip_hashbang else 0
-        cutoff = _opening_start_cutoff(record.content, self.max_start_row)
-        comment_ranges: list[tuple[int, int]] = []
-        previous_range: tuple[int, int] | None = None
-        for start, end in _opening_comment_ranges_starting_before(
-            query,
-            record.content,
-            start_anchor,
-            cutoff,
-        ):
-            if previous_range is not None and _comments_are_contiguous(
-                record.content,
-                previous_range[0],
-                previous_range[1],
-                start,
-                end,
-            ):
-                previous_start, _ = comment_ranges[-1]
-                comment_ranges[-1] = (previous_start, end)
-            else:
-                comment_ranges.append((start, end))
-            previous_range = (start, end)
-
         comments: list[ExtractedComment] = []
-        for start, end in comment_ranges:
-            start_line = query._row_number(record.content, start)
-            text = record.content[start:end].strip()
-            if text:
+        seen: set[tuple[int, int, str]] = set()
+        for language in languages:
+            query = self._query_for_language(language)
+            start_anchor = (
+                query._hashbang_end(record.content) if query.skip_hashbang else 0
+            )
+            cutoff = _opening_start_cutoff(record.content, self.max_start_row)
+            comment_ranges: list[tuple[int, int]] = []
+            previous_range: tuple[int, int] | None = None
+            for start, end in _opening_comment_ranges_starting_before(
+                query,
+                record.content,
+                start_anchor,
+                cutoff,
+            ):
+                if previous_range is not None and _comments_are_contiguous(
+                    record.content,
+                    previous_range[0],
+                    previous_range[1],
+                    start,
+                    end,
+                ):
+                    previous_start, _ = comment_ranges[-1]
+                    comment_ranges[-1] = (previous_start, end)
+                else:
+                    comment_ranges.append((start, end))
+                previous_range = (start, end)
+
+            for start, end in comment_ranges:
+                text = record.content[start:end].strip()
+                identity = (start, end, text)
+                if not text or identity in seen:
+                    continue
+                seen.add(identity)
                 comments.append(
                     ExtractedComment(
                         text=text,
-                        start_line=start_line,
+                        start_line=query._row_number(record.content, start),
                         index=len(comments),
                     )
                 )
-        return comments
+        comments.sort(key=lambda item: (item.start_line or 0, item.index or 0))
+        return [
+            ExtractedComment(
+                text=item.text,
+                start_line=item.start_line,
+                index=index,
+            )
+            for index, item in enumerate(comments)
+        ]
 
     def supports_language_value(self, value: str) -> bool:
         with self._lock:
-            return any(
-                candidate in self._supported_languages
-                for candidate in _normalize_language_token(value)
-            )
+            return self._canonical_language(value) is not None
 
     def _resolve_language(self, record: InputRecord) -> str | None:
+        languages = self._resolve_languages(record)
+        return languages[0] if languages else None
+
+    def _resolve_languages(self, record: InputRecord) -> list[str]:
+        resolved_languages: list[str] = []
         with self._lock:
             for raw_language in self._language_candidates(record):
                 if raw_language in self._query_languages:
                     cached = self._query_languages[raw_language]
-                    if cached is not None:
-                        return cached
-                    continue
+                else:
+                    cached = self._canonical_language(raw_language)
+                    self._query_languages[raw_language] = cached
+                if cached is not None and cached not in resolved_languages:
+                    resolved_languages.append(cached)
 
-                resolved = next(
-                    (
-                        candidate
-                        for candidate in _normalize_language_token(raw_language)
-                        if candidate in self._supported_languages
-                    ),
-                    None,
-                )
-                self._query_languages[raw_language] = resolved
-                if resolved is not None:
-                    return resolved
+        return resolved_languages
 
+    def _canonical_language(self, raw_language: str) -> str | None:
+        candidates = (raw_language, *_normalize_language_token(raw_language))
+        for candidate in candidates:
+            if candidate in self._supported_languages:
+                return candidate
+        for candidate in candidates:
+            try:
+                canonical = get_comment_syntax(candidate).canonical_name
+            except NotImplementedError:
+                continue
+            if canonical in self._supported_languages:
+                return canonical
         return None
 
     def _query_for_language(self, language: str) -> Any:
@@ -358,13 +454,19 @@ class ML4SEOpeningCommentExtractor:
     @staticmethod
     def _language_candidates(record: InputRecord) -> list[str]:
         metadata = record.metadata
-        candidates = [
+        candidates: list[Any] = [
             metadata.get("selected_language"),
             record.language,
             metadata.get("path_language"),
-            metadata.get("ext"),
-            metadata.get("lang"),
         ]
+        extension = metadata.get("ext")
+        if extension is not None:
+            extension_token = str(extension).lower().lstrip(".")
+            candidates.extend(_forge_extension_languages().get(extension_token, ()))
+            candidates.append(extension_token)
+        if metadata.get("detect_language_from_content"):
+            candidates.extend(_content_language_candidates(record.content))
+        candidates.append(metadata.get("lang"))
         result: list[str] = []
         seen = set()
         for candidate in candidates:

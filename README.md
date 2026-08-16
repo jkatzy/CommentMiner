@@ -20,8 +20,8 @@ JSON files are control artifacts only: configuration, checkpoints, manifests, an
 - [`uv`](https://docs.astral.sh/uv/) for dependency and command execution
 - A Hugging Face token for gated datasets such as The Stack, The Stack v2, and StarCoderData
 - The Codex CLI, authenticated and able to access the configured model, for
-  redistribution-candidate judging; it remains optional for topic-cluster
-  validation
+  redistribution-candidate and classifier-dataset judging; it remains optional
+  for topic-cluster validation
 
 Install all dependencies, including ScanCode Toolkit, BERTopic, and SentenceTransformers:
 
@@ -39,17 +39,119 @@ uv run commentminer validate-config config/pipeline.example.json
 
 ## Supported Sources
 
-Every configured source uses a Hugging Face dataset repository.
+Every configured source uses either a Hugging Face dataset repository or a
+Hugging Face Storage Bucket.
 
 | Config name | Hugging Face dataset | Input path |
 | --- | --- | --- |
 | `the-stack` | `bigcode/the-stack` | Language-partitioned Parquet |
-| `the-stack-v2` | `bigcode/the-stack-v2` | Parquet metadata plus Software Heritage blobs |
-| `the-stack-v2-dedup` | `bigcode/the-stack-v2-dedup` | Deduplicated Parquet metadata plus Software Heritage blobs |
-| `starcoderdata` | `bigcode/starcoderdata` | Language-partitioned Parquet |
+| `the-stack-v2` | `bigcode/the-stack-v2` | Full-corpus Parquet metadata plus Software Heritage blobs |
+| `the-stack-v3-full` | `HuggingFaceCode/stack-v3-full` | Full-corpus bucket `contents/language=*/` Parquet shards |
 | `the-heap` | `AISE-TUDelft/the-heap` | Language-partitioned Parquet |
+| `redpajama-v1-github` | `togethercomputer/RedPajama-Data-1T` | GitHub JSONL shards listed by the Hub manifest |
+| `pile-uncopyrighted-github` | `monology/pile-uncopyrighted` | `Github` records from Zstandard JSONL shards |
+| `codeparrot-clean-valid` | `codeparrot/codeparrot-clean-valid` | Cleaned validation gzip JSONL |
+| `codeparrot-github-code` | `codeparrot/github-code` | Native Parquet GitHub code shards |
+| `code-clippy-github` | `CodedotAI/code_clippy_github` | Deduplicated gzip JSONL GitHub code shards |
 
-The Stack v2 repositories contain blob IDs rather than source text. CommentMiner reads their metadata from Hugging Face, fetches the corresponding gzipped content from Software Heritage S3, decodes it using `src_encoding`, extracts comments, and does not persist the source text. This sidecar content lookup is part of the two Stack v2 Hugging Face configurations.
+The Stack v2 deduplicated repository contains blob IDs rather than source text. CommentMiner reads its metadata from Hugging Face, fetches the corresponding gzipped content from Software Heritage S3, decodes it using `src_encoding`, extracts comments, and does not persist the source text.
+
+The complete Stack v3 corpus is stored as a Storage Bucket rather than a
+normal Hub dataset. Its dedicated runner inventories all language partitions,
+then lets 64 independent processes download and extract unrelated Parquet
+shards in completion order. A shard is deleted after extraction and a separate
+completion marker makes restarts idempotent:
+
+```bash
+scripts/run-stack-v3-resilient.sh
+```
+
+Track a live run in an SSH-friendly terminal dashboard with:
+
+```bash
+scripts/stack-v3-dashboard.sh
+```
+
+The dashboard shows completed and active shards, rolling throughput and ETA,
+scratch-download and host-network rates, pipeline and host CPU, active workers,
+raw/partial/output file counts, an exact record progress bar for the active
+downloaded shard wave, and an approximate corpus-wide record bar based on the
+dataset card's 43.9 billion metadata entries minus 28.3 billion stubs. The
+numerator is summed from cumulative per-shard checkpoints. It also shows
+extracted records and comments, memory, swap, free disk, and recent runner
+events. Press `q` to quit. For logs or automation
+without an interactive terminal, use `scripts/stack-v3-dashboard.sh --once` or
+add `--json`.
+
+Disk I/O percentages compare `/proc/diskstats` throughput for the backing block
+device with defaults of 2,000 MiB/s read and 1,000 MiB/s write. Override those
+ceilings when you have measured values with `--max-disk-read-mib-s` and
+`--max-disk-write-mib-s`; the dashboard also reports the kernel's device-busy
+percentage independently of those configured maxima.
+
+Shard timing covers download start through extraction finish when both events
+are present in the logs, and extraction time otherwise. The dashboard shows the
+latest five durations and mean, standard deviation, median, and p10-p90 spread
+over the latest 100 completed shards across the five most recent Stack v3 logs.
+The live-pipeline section maps live worker-owned shards back to the inventory
+and displays each active language as `language (active, completed/total)`, for
+example `C++ (96, 187/624)`.
+
+Set `SHARD_WORKERS`, `LANGUAGES`, or `MAX_SHARDS` to tune or bound a run. The
+extractor uses the newest pinned ML4SE toolkit registry and retains the existing
+opening-comment rule: comments must start within the first 10 source rows.
+
+Stack v3 source shards and partial downloads are unconditionally deleted after
+each worker attempt. The retained comment-only Parquet files are written below
+`var/output/the-stack-v3-full/`. Materialize them into a Hugging Face dataset
+upload tree with:
+
+```bash
+uv run commentminer export-hf-dataset \
+  config/pipeline.example.json \
+  var/comment-dataset-the-stack-v3-full \
+  --input-directory var/output/the-stack-v3-full \
+  --workers 64
+```
+
+RedPajama V1 stores `urls/github.txt` on the Hub rather than the source shards
+themselves. CommentMiner reads that manifest, streams each external JSONL shard
+line by line, maps `text` and nested `meta` provenance into input records, and
+infers the programming language from the source path extension. Use
+`--max-files` and `--max-records` for bounded runs:
+
+```bash
+uv run commentminer mine-dataset \
+  config/pipeline.example.json \
+  redpajama-v1-github \
+  --max-files 1 \
+  --max-records 1000
+```
+
+Extension detection uses the vendored
+[FORGE language mapping](https://github.com/AISE-TUDelft/FORGE-ds-intermediate/blob/861acf2095899cb5336bbf85401b4b2191686018/code/langs_extension.json).
+When an extension maps to multiple languages, CommentMiner runs every mapped
+language supported by `ml4setk` and deduplicates identical extracted ranges.
+
+The Pile source reads only records with `meta.pile_set_name == "Github"`.
+Because the Pile does not preserve source paths or extensions, CommentMiner
+uses Pygments content-based lexer detection for these records before invoking
+the matching `ml4setk` comment parser. Each roughly 11 GB compressed shard is
+processed and removed before the next shard is downloaded:
+
+```bash
+uv run commentminer mine-dataset \
+  config/pipeline.example.json \
+  pile-uncopyrighted-github \
+  --max-files 1 \
+  --max-records 1000
+```
+
+CodeParrot Clean Valid and Code Clippy use the gzip-JSONL adapter, while
+CodeParrot GitHub Code uses the generic Parquet adapter. All three preserve
+repository, path, language, license, and size metadata when supplied upstream.
+Their source paths also participate in the FORGE multi-language extension
+mapping.
 
 Non-Hugging-Face source configurations are rejected when a pipeline configuration is loaded.
 
@@ -157,12 +259,14 @@ uv run commentminer mine-config \
 For large Stack v2 runs, fixed-size blob-ID packages balance work more evenly than whole-language tasks. Metadata shards are staged, divided into disjoint packages, and processed concurrently:
 
 ```bash
-DATASET=the-stack-v2-dedup \
+DATASET=the-stack-v2 \
 TOKEN_ENV=HF_TOKEN \
 PACKAGE_SIZE=10000 \
+METADATA_DOWNLOAD_WORKERS=64 \
 PACKAGE_WORKERS=64 \
 PACKAGE_WORKER_BACKEND=process \
 CONTENT_DOWNLOAD_WORKERS=2048 \
+EXTRACTION_WORKERS=1 \
 scripts/run-stack-v2-id-packages.sh
 ```
 
@@ -171,15 +275,17 @@ The equivalent CLI entry point is:
 ```bash
 uv run commentminer mine-stack-v2-packages \
   config/pipeline.example.json \
-  the-stack-v2-dedup \
+  the-stack-v2 \
   --package-size 10000 \
+  --metadata-download-workers 64 \
   --package-workers 64 \
   --package-worker-backend process \
   --content-download-workers 2048 \
+  --extraction-workers 1 \
   --token-env HF_TOKEN
 ```
 
-Package directories include the dataset, package index, and a digest, so parallel workers do not collide. Process workers recycle after one package by default; pass `--package-worker-max-tasks-per-child 0` to disable recycling.
+Package directories include the dataset, package index, and a digest, so parallel workers do not collide. Packages may finish in any order; the bounded process pool keeps 64 independent blocks active and immediately schedules another when one finishes. Process workers recycle after one package by default; pass `--package-worker-max-tasks-per-child 0` to disable recycling.
 
 Local throughput tools are available in `scripts/benchmark-stack-v2-throughput.py` and `scripts/benchmark-stack-v2-worker-matrix.py`. The matrix benchmark writes CSV results and a JSON plan report.
 
@@ -276,16 +382,51 @@ Dataset/language filters and `--max-shards` are available for bounded inspection
 
 ### Topic modelling
 
-Run BERTopic on comments below a ScanCode threshold. Ratio and percentage forms are equivalent, so `0.95` and `95` both mean 95 percent:
+Run guided BERTopic on comments below a ScanCode threshold. The default model uses four phrase-level seed groups for proprietary/confidential markings, non-license sharing restrictions, custom or unrecognized licenses, and customer/contract-specific terms. Ratio and percentage forms are equivalent, so `0.95` and `95` both mean 95 percent.
+
+The input may be either a local ScanCode-enriched Parquet directory or a Hugging Face dataset ID. Dataset IDs are resolved through the standard Hugging Face cache; dataset and language filters are also used to limit the snapshot files fetched.
+
+```bash
+uv run commentminer topic-model-low-scancode Jkatzy/code-comments \
+  --datasets the-stack-v2-dedup \
+  --languages Python \
+  --score-threshold 0.95 \
+  --sharing-prefilter \
+  --min-topic-size 10
+```
+
+`--sharing-prefilter` first keeps only comments containing one of the curated
+sharing, confidentiality, disclosure, or permission keywords, then runs
+BERTopic on that smaller candidate set. Matches are case-insensitive whole
+words, so the keyword `share` does not select `shared memory`. Add or replace
+the focus with repeatable custom terms:
+
+```bash
+uv run commentminer topic-model-low-scancode Jkatzy/code-comments \
+  --datasets the-stack-v2-dedup \
+  --languages Python \
+  --prefilter-keyword confidential \
+  --prefilter-keyword "do not distribute"
+```
+
+The manifest records the effective keyword list, the number of score-eligible
+comments before the prefilter, and how many comments it removed. Omitting both
+prefilter options preserves the unfiltered low-ScanCode workflow.
+
+For a small first extraction, select one dataset/language subset and one Parquet shard—for example, Python from The Stack v2 deduplicated:
 
 ```bash
 uv run commentminer topic-model-low-scancode \
   var/comment-dataset-the-stack-v2-dedup-license-scan \
+  --datasets the-stack-v2-dedup \
+  --languages Python \
+  --max-shards 1 \
   --score-threshold 0.95 \
-  --min-topic-size 10 \
-  --save-model \
-  --judge-with-codex
+  --sharing-prefilter \
+  --min-topic-size 10
 ```
+
+`SHARING_PREFILTER_KEYWORDS`, `SEED_TOPICS`, and the separate `GOVERNMENT_RESTRICTION_SEEDS` list are available from `commentminer.topic_modelling` for Python callers. Pass the sharing keywords through `prefilter_keywords`; customize BERTopic through `bertopic_model_kwargs`. Seeds guide clustering; their order and names do not define the discovered BERTopic topic IDs. Do not treat a restrictive cluster as proof that publication was unauthorized.
 
 The sibling output directory can contain:
 
@@ -420,6 +561,89 @@ uv run commentminer verify-redistribution-candidate-dataset \
 
 See [`docs/redistribution-candidates.md`](docs/redistribution-candidates.md)
 for the sampling semantics, labels, explicit CLI, and preset overrides.
+
+### Sharing-restriction classifier dataset
+
+`build-classifier-dataset` turns the ScanCode-enriched comment tree into three
+training classes:
+
+- `sharing_restriction`: an extra confidentiality, proprietary, internal-use,
+  controlled-information, or other non-license limit on sharing, including
+  mixed comments that also contain license text
+- `scancode_missed_license`: genuine software-license notices that have
+  `contains_license_notice=false`
+- `irrelevant`: ordinary comments that are neither of the above
+
+The first class has `binary_label=1`; both other classes have
+`binary_label=0` and remain distinguishable as hard-negative subtypes.
+Candidate keywords are retrieval signals only. Every retained unique comment
+must pass two distinct row-level Codex prompt setups using the configured model:
+a strict semantic review and a skeptical counter-review. Both decisions must agree with the candidate class
+and semantic booleans, satisfy the class invariants, and meet the confidence
+threshold. License-presence fields remain independent and truthful for mixed
+positive comments.
+Technical boundary cases such as internal-only API notes and repository-copy or
+dependency instructions are deliberately sampled into the irrelevant route;
+the judges must confirm that they do not constrain who may receive the code.
+Malformed, incomplete, ambiguous, low-confidence, and disagreeing decisions
+go to `rejected.parquet` rather than the training set.
+
+Run the bounded, manifest-recorded four-dataset, three-language preset and
+verify it:
+
+```bash
+scripts/run-sharing-restriction-classifier-dataset.sh
+```
+
+The helper defaults to eight source/language combinations: Python and
+JavaScript from The Stack and RedPajama GitHub, Python and Java from The Heap,
+and Python and Java from The Stack v2 deduplicated. It scans the
+lexicographically first eight `part-*.parquet` shards in each cell by default.
+The supported environment overrides are `INPUT`, `OUTPUT`, `JUDGE_CACHE`,
+`CODEX_MODEL`, `TARGET_PER_COMBINATION`, `CANDIDATE_MULTIPLIER`,
+`MAX_SHARDS_PER_COMBINATION`, and `JUDGE_WORKERS`. Use the equivalent CLI with
+repeatable `--combination DATASET:LANGUAGE` options to change the fixed matrix.
+Candidate selection and splitting are seeded; remote model outputs and
+concurrent response-log ordering are not guaranteed to be byte-reproducible.
+
+The output directory contains:
+
+- `binary-training.parquet` and `multiclass-training.parquet`, task-specific
+  projections with exactly one target plus comment text, split, ID, and source
+  stratum (use `opening_comment` as the model feature)
+- `dataset.parquet` and one Parquet file per class, with audit metadata that
+  directly reveals the label and must not be used as model features
+- `candidates.parquet` and `rejected.parquet` for selection auditing
+- `judge-responses.jsonl` and `judge-rubric.md`, plus an SQLite judge cache at
+  the configured cache path; reuse requires the same prompt, setup, batch
+  context, declared model, Codex version, settings, and cache epoch
+- `manifest.json`, `verification.json`, and a dataset card
+
+The verifier requires unique normalized comments, ScanCode-negative status,
+complete judge consensus, label/boolean consistency, exact class-file counts,
+content-hashed audit artifacts, and leakage-aware groups confined to one of
+train, validation, or test. Repository, near-template, and recognized
+boilerplate-marker families are joined transitively into the same split
+component. Add `--verify-source` when the trusted original source tree is
+available to re-hash every selected shard, check recorded source manifests,
+and compare every accepted source row:
+
+```bash
+uv run commentminer verify-classifier-dataset \
+  var/sharing-restriction-classifier-dataset \
+  --verify-source \
+  --write-report
+```
+
+Comments plus their dataset/language/path/ScanCode metadata are sent to the
+configured model service. The Codex backend ignores user config and rules,
+runs in an empty directory, and disables local, web, app, plugin, browser,
+computer-use, and image tools while judging this untrusted text.
+
+These are LLM-assisted weak labels. Inspect the saved evidence, rationales, and
+rejections before using them in high-stakes policy or compliance decisions.
+The output is a quota-balanced retrieval sample, not a prevalence sample; its
+class and dataset/language proportions do not estimate corpus frequencies.
 
 ### Encoder capacity benchmark
 

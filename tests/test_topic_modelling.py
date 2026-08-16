@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 import unittest
+from unittest.mock import Mock, patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sklearn.feature_extraction.text import CountVectorizer
 
+from commentminer import topic_modelling
 from commentminer.topic_modelling import run_low_scancode_topic_modelling
 
 
@@ -46,6 +51,193 @@ def _write_parquet(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class TopicModellingTests(unittest.TestCase):
+    def test_resolves_huggingface_dataset_id_through_snapshot_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            cached = root / "cached-snapshot"
+            _write_parquet(
+                cached / "the-stack" / "Python" / "part-00000.parquet",
+                [
+                    {
+                        "dataset": "the-stack",
+                        "record_id": "remote-low",
+                        "opening_comment": "MIT notice",
+                        "language": "Python",
+                        "comment_license_score": 80.0,
+                    }
+                ],
+            )
+
+            with patch(
+                "huggingface_hub.snapshot_download", return_value=str(cached)
+            ) as download:
+                stats = run_low_scancode_topic_modelling(
+                    "owner/code-comments",
+                    output_directory=root / "topics",
+                    dataset_names=["the-stack"],
+                    languages=["Python"],
+                    bertopic_model=FakeTopicModel(),
+                )
+
+            download.assert_called_once_with(
+                repo_id="owner/code-comments",
+                repo_type="dataset",
+                allow_patterns=["the-stack/Python/part-*.parquet"],
+            )
+            self.assertEqual(stats.records_selected, 1)
+            self.assertEqual(stats.input_directory, cached.resolve())
+
+    def test_builds_bertopic_with_default_phrase_seeds_and_vectorizer(self) -> None:
+        constructor = Mock(return_value=object())
+        fake_bertopic = ModuleType("bertopic")
+        fake_bertopic.BERTopic = constructor
+
+        with patch.dict(sys.modules, {"bertopic": fake_bertopic}):
+            model = topic_modelling._build_bertopic_model(
+                min_topic_size=10,
+                calculate_probabilities=False,
+                model_kwargs={},
+            )
+
+        self.assertIs(model, constructor.return_value)
+        constructor.assert_called_once()
+        kwargs = constructor.call_args.kwargs
+        self.assertEqual(kwargs["min_topic_size"], 10)
+        self.assertIs(kwargs["calculate_probabilities"], False)
+        self.assertEqual(
+            kwargs["seed_topic_list"],
+            list(topic_modelling.SEED_TOPICS.values()),
+        )
+        self.assertEqual(
+            list(topic_modelling.SEED_TOPICS),
+            [
+                "proprietary_or_confidential",
+                "non_license_sharing_restrictions",
+                "custom_or_unrecognized_license",
+                "customer_or_contract_specific",
+            ],
+        )
+        self.assertTrue(
+            all(
+                " " in phrase
+                for phrases in topic_modelling.SEED_TOPICS.values()
+                for phrase in phrases
+            )
+        )
+
+        vectorizer = kwargs["vectorizer_model"]
+        self.assertIsInstance(vectorizer, CountVectorizer)
+        self.assertEqual(vectorizer.ngram_range, (1, 3))
+        self.assertEqual(vectorizer.min_df, 2)
+        self.assertIsNone(vectorizer.stop_words)
+
+    def test_government_restriction_seeds_are_not_default_topics(self) -> None:
+        default_seed_lists = list(topic_modelling.SEED_TOPICS.values())
+
+        self.assertEqual(len(default_seed_lists), 4)
+        self.assertNotIn(
+            topic_modelling.GOVERNMENT_RESTRICTION_SEEDS,
+            default_seed_lists,
+        )
+
+    def test_opt_in_candidate_seed_families_are_complete_and_distinct(self) -> None:
+        provenance = topic_modelling.PROPRIETARY_PROVENANCE_SEEDS
+        funding = topic_modelling.FUNDING_DISSEMINATION_SEEDS
+        export = topic_modelling.EXPORT_CONTROL_SEEDS
+        unpublished = topic_modelling.UNPUBLISHED_WORK_SEEDS
+
+        self.assertEqual(len(provenance), 24)
+        self.assertEqual(len(funding), 24)
+        self.assertEqual(len(export), 37)
+        self.assertEqual(len(unpublished), 30)
+        self.assertIn("source code recreated from a .class file", provenance)
+        self.assertIn("stolen source code", provenance)
+        self.assertIn("funded by", funding)
+        self.assertIn("Distribution Statement D", funding)
+        self.assertIn("subject to export control laws", export)
+        self.assertIn("ECCN", export)
+        self.assertIn("not subject to export control", export)
+        self.assertIn("unpublished copyrighted work", unpublished)
+        self.assertIn(
+            "does not evidence any actual or intended publication",
+            unpublished,
+        )
+        self.assertIn("source code for this program is not published", unpublished)
+
+        normalized_families = [
+            {phrase.casefold() for phrase in family}
+            for family in (provenance, funding, export, unpublished)
+        ]
+        self.assertTrue(
+            all(
+                len(raw_family) == len(normalized_family)
+                for raw_family, normalized_family in zip(
+                    (provenance, funding, export, unpublished),
+                    normalized_families,
+                    strict=True,
+                )
+            )
+        )
+        self.assertTrue(normalized_families[0].isdisjoint(normalized_families[1]))
+        self.assertTrue(normalized_families[0].isdisjoint(normalized_families[2]))
+        self.assertTrue(normalized_families[1].isdisjoint(normalized_families[2]))
+        self.assertTrue(normalized_families[1].isdisjoint(normalized_families[3]))
+        self.assertTrue(normalized_families[2].isdisjoint(normalized_families[3]))
+
+        # The existing default and government inventories stay stable. Export
+        # is deliberately self-contained and owns these five exact overlaps.
+        self.assertEqual(sum(map(len, topic_modelling.SEED_TOPICS.values())), 126)
+        self.assertEqual(len(topic_modelling.GOVERNMENT_RESTRICTION_SEEDS), 18)
+        government = {
+            phrase.casefold()
+            for phrase in topic_modelling.GOVERNMENT_RESTRICTION_SEEDS
+        }
+        self.assertEqual(
+            normalized_families[2] & government,
+            {
+                "export controlled",
+                "export control",
+                "itar controlled",
+                "ear controlled",
+                "us persons only",
+            },
+        )
+        default = {
+            phrase.casefold()
+            for phrases in topic_modelling.SEED_TOPICS.values()
+            for phrase in phrases
+        }
+        self.assertTrue(
+            all(
+                family.isdisjoint(default)
+                for family in normalized_families[:3]
+            )
+        )
+        self.assertEqual(
+            normalized_families[3] & default,
+            {"unpublished work", "not intended for publication"},
+        )
+        self.assertEqual(
+            normalized_families[3] & normalized_families[0],
+            {"unpublished proprietary source code"},
+        )
+
+    def test_sharing_prefilter_captures_restriction_phrases_without_substrings(self) -> None:
+        keywords = topic_modelling._normalize_prefilter_keywords(  # noqa: SLF001
+            topic_modelling.SHARING_PREFILTER_KEYWORDS
+        )
+        matcher = topic_modelling._compile_keyword_prefilter(keywords)  # noqa: SLF001
+
+        self.assertIsNotNone(matcher)
+        assert matcher is not None
+        self.assertIsNotNone(
+            matcher.search("This material may not be SHARED outside Example Corp.")
+        )
+        self.assertIsNotNone(matcher.search("Copying is prohibited without approval."))
+        self.assertIsNotNone(matcher.search("For internal use only."))
+        self.assertIsNone(matcher.search("Allocate a shared memory buffer."))
+        self.assertIsNone(matcher.search("Copying values from device memory."))
+
     def test_models_comments_below_normalized_scancode_threshold_and_runs_codex_judge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -168,6 +360,162 @@ class TopicModellingTests(unittest.TestCase):
             report = json.loads((output_directory / "codex-cluster-validation.json").read_text(encoding="utf-8"))
             self.assertEqual(report["parsed_response"]["overall_assessment"], "clusters are coherent")
             self.assertTrue((output_directory / "bertopic-model" / "model.txt").exists())
+
+    def test_keyword_prefilter_matches_any_normalized_whole_word_or_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_directory = root / "license-scan"
+            output_directory = root / "topics"
+            _write_parquet(
+                input_directory / "combined" / "Cuda" / "part-00000.parquet",
+                [
+                    {
+                        "dataset": "combined",
+                        "record_id": "share",
+                        "opening_comment": "DO NOT SHARE outside the company",
+                        "language": "Cuda",
+                        "comment_license_score": 80.0,
+                    },
+                    {
+                        "dataset": "combined",
+                        "record_id": "phrase",
+                        "opening_comment": "This is private and\n\tCONFIDENTIAL material",
+                        "language": "Cuda",
+                        "comment_license_score": 70.0,
+                    },
+                    {
+                        "dataset": "combined",
+                        "record_id": "shared-memory",
+                        "opening_comment": "Allocate a shared memory buffer",
+                        "language": "Cuda",
+                        "comment_license_score": 60.0,
+                    },
+                    {
+                        "dataset": "combined",
+                        "record_id": "ordinary",
+                        "opening_comment": "Generated project header",
+                        "language": "Cuda",
+                        "comment_license_score": 50.0,
+                    },
+                    {
+                        "dataset": "combined",
+                        "record_id": "high-score",
+                        "opening_comment": "Do not share this externally",
+                        "language": "Cuda",
+                        "comment_license_score": 99.0,
+                    },
+                ],
+            )
+
+            model = FakeTopicModel()
+            stats = run_low_scancode_topic_modelling(
+                input_directory,
+                output_directory=output_directory,
+                score_threshold=95.0,
+                prefilter_keywords=[
+                    " share ",
+                    "PRIVATE   AND CONFIDENTIAL",
+                    "SHARE",
+                ],
+                bertopic_model=model,
+            )
+
+            self.assertEqual(
+                model.documents,
+                [
+                    "DO NOT SHARE outside the company",
+                    "This is private and\n\tCONFIDENTIAL material",
+                ],
+            )
+            self.assertEqual(stats.prefilter_keywords, ("share", "private and confidential"))
+            self.assertEqual(stats.records_seen, 5)
+            self.assertEqual(stats.records_before_keyword_prefilter, 4)
+            self.assertEqual(stats.records_prefiltered_out, 2)
+            self.assertEqual(stats.records_selected, 2)
+            self.assertEqual(stats.records_modelled, 2)
+
+            assignments = pq.read_table(
+                output_directory / "topic-assignments.parquet"
+            ).to_pylist()
+            self.assertEqual(
+                [row["record_id"] for row in assignments],
+                ["share", "phrase"],
+            )
+
+            manifest = json.loads(
+                (output_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["keyword_prefilter"],
+                {
+                    "enabled": True,
+                    "keywords": ["share", "private and confidential"],
+                    "match_mode": "any_case_insensitive_whole_word_or_phrase",
+                },
+            )
+            self.assertEqual(manifest["records_before_keyword_prefilter"], 4)
+            self.assertEqual(manifest["records_prefiltered_out"], 2)
+
+    def test_keyword_prefilter_writes_empty_outputs_when_nothing_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_directory = root / "license-scan"
+            output_directory = root / "topics"
+            _write_parquet(
+                input_directory / "combined" / "Cuda" / "part-00000.parquet",
+                [
+                    {
+                        "dataset": "combined",
+                        "record_id": "shared-memory",
+                        "opening_comment": "Use shared memory for this buffer",
+                        "language": "Cuda",
+                        "comment_license_score": 20.0,
+                    },
+                    {
+                        "dataset": "combined",
+                        "record_id": "ordinary",
+                        "opening_comment": "Generated project header",
+                        "language": "Cuda",
+                        "comment_license_score": 30.0,
+                    },
+                ],
+            )
+            model = Mock()
+
+            stats = run_low_scancode_topic_modelling(
+                input_directory,
+                output_directory=output_directory,
+                prefilter_keywords=["share"],
+                bertopic_model=model,
+            )
+
+            model.fit_transform.assert_not_called()
+            self.assertEqual(stats.prefilter_keywords, ("share",))
+            self.assertEqual(stats.records_before_keyword_prefilter, 2)
+            self.assertEqual(stats.records_prefiltered_out, 2)
+            self.assertEqual(stats.records_selected, 0)
+            self.assertEqual(stats.records_modelled, 0)
+            self.assertEqual(
+                pq.read_table(output_directory / "topic-assignments.parquet").num_rows,
+                0,
+            )
+            topics = json.loads(
+                (output_directory / "topics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(topics["topic_count"], 0)
+            manifest = json.loads(
+                (output_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["keyword_prefilter"],
+                {
+                    "enabled": True,
+                    "keywords": ["share"],
+                    "match_mode": "any_case_insensitive_whole_word_or_phrase",
+                },
+            )
+            self.assertEqual(manifest["records_before_keyword_prefilter"], 2)
+            self.assertEqual(manifest["records_prefiltered_out"], 2)
 
     def test_models_huggingface_parquet_scan_output_with_dataset_language_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

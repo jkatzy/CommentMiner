@@ -6,10 +6,11 @@ import json
 import logging
 import math
 from pathlib import Path
+import re
 import shutil
 import shlex
 import subprocess
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Pattern, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -330,6 +331,76 @@ EXPORT_CONTROL_SEEDS = [
     "not subject to export control",
 ]
 
+# High-signal words and phrases for building a sharing-related candidate set
+# before BERTopic runs. Deliberately omit noisy standalone inflections such as
+# ``shared`` and ``distributed`` because they mostly describe programming
+# concepts (for example, CUDA shared memory and distributed computation).
+SHARING_PREFILTER_KEYWORDS = (
+    "confidential",
+    "confidentiality",
+    "proprietary",
+    "distribute",
+    "distribution",
+    "redistribute",
+    "redistribution",
+    "disclose",
+    "disclosure",
+    "disseminate",
+    "dissemination",
+    "share",
+    "sharing",
+    "reproduce",
+    "reproduction",
+    "permission",
+    "consent",
+    "authorization",
+    "authorisation",
+    "unauthorized",
+    "unauthorised",
+    "nondisclosure",
+    "non-disclosure",
+    # Phrase expansions capture common inflected restriction wording without
+    # admitting noisy standalone words such as ``shared`` or ``copying``.
+    "trade secret",
+    "trade secrets",
+    "internal use only",
+    "for internal use",
+    "not for public release",
+    "not intended for publication",
+    "do not distribute",
+    "not be distributed",
+    "not for distribution",
+    "distribution prohibited",
+    "do not disclose",
+    "not be disclosed",
+    "disclosure prohibited",
+    "do not disseminate",
+    "not be disseminated",
+    "dissemination prohibited",
+    "do not share",
+    "not be shared",
+    "sharing prohibited",
+    "do not copy",
+    "not be copied",
+    "copying prohibited",
+    "copying is prohibited",
+    "do not reproduce",
+    "not be reproduced",
+    "reproduction prohibited",
+    "strictly forbidden",
+    "prior written permission",
+    "express written permission",
+    "express written consent",
+    "without written authorization",
+    "without written authorisation",
+    "authorized personnel only",
+    "authorised personnel only",
+    "intended recipient only",
+    "no external distribution",
+    "no external disclosure",
+    "return or destroy all copies",
+)
+
 _TOPIC_ASSIGNMENT_SCHEMA = pa.schema(
     [
         ("ordinal", pa.int64()),
@@ -375,6 +446,9 @@ class TopicModellingStats:
     manifest_path: Path | None = None
     model_path: Path | None = None
     codex_judge_report_path: Path | None = None
+    prefilter_keywords: tuple[str, ...] = ()
+    records_before_keyword_prefilter: int = 0
+    records_prefiltered_out: int = 0
 
 
 @dataclass(slots=True)
@@ -395,14 +469,103 @@ class _LoadedComments:
     records_seen: int = 0
     records_missing_score: int = 0
     records_without_comment: int = 0
+    records_before_keyword_prefilter: int = 0
+    records_prefiltered_out: int = 0
     shards_read: int = 0
 
 
+def _resolve_topic_modelling_input(
+    source: Path | str,
+    *,
+    dataset_names: Iterable[str] | None,
+    languages: Iterable[str] | None,
+) -> Path:
+    """Resolve a local directory or a Hub dataset ID to a local cached snapshot."""
+
+    candidate = Path(source).expanduser()
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise ValueError(f"Input ScanCode output is not a directory: {candidate}")
+        return candidate.resolve()
+
+    # Path objects retain the old, unambiguous local-directory behavior. A Hub
+    # ID is accepted as a string in the conventional ``owner/dataset`` form.
+    if isinstance(source, Path) or "/" not in source:
+        raise ValueError(f"Input ScanCode output directory does not exist: {candidate.resolve()}")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface-hub is required to use a Hugging Face dataset ID"
+        ) from exc
+
+    datasets = list(dataset_names or [])
+    selected_languages = list(languages or [])
+    if datasets and selected_languages:
+        allow_patterns = [
+            f"{dataset}/{language}/part-*.parquet"
+            for dataset in datasets
+            for language in selected_languages
+        ]
+    elif datasets:
+        allow_patterns = [f"{dataset}/*/part-*.parquet" for dataset in datasets]
+    elif selected_languages:
+        allow_patterns = [f"*/{language}/part-*.parquet" for language in selected_languages]
+    else:
+        allow_patterns = ["*/*/part-*.parquet", "part-*.parquet"]
+
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=source,
+            repo_type="dataset",
+            allow_patterns=allow_patterns,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Unable to cache Hugging Face dataset '{source}': {exc}") from exc
+    return Path(snapshot_path).resolve()
+
+
+def _normalize_prefilter_keywords(
+    keywords: Iterable[str] | None,
+) -> tuple[str, ...]:
+    if keywords is None:
+        return ()
+    raw_keywords = [keywords] if isinstance(keywords, str) else keywords
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for keyword in raw_keywords:
+        if not isinstance(keyword, str):
+            raise ValueError(f"Prefilter keywords must be strings, got {keyword!r}")
+        value = " ".join(keyword.split()).casefold()
+        if not value:
+            raise ValueError("Prefilter keywords must not be empty")
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return tuple(normalized)
+
+
+def _compile_keyword_prefilter(keywords: Sequence[str]) -> Pattern[str] | None:
+    if not keywords:
+        return None
+    alternatives = []
+    for keyword in sorted(keywords, key=len, reverse=True):
+        # Normalization collapses phrase whitespace to spaces. Match those
+        # spaces flexibly so a phrase can span lines in a block comment.
+        alternatives.append(re.escape(keyword).replace(r"\ ", r"\s+"))
+    return re.compile(
+        r"(?<!\w)(?:" + "|".join(alternatives) + r")(?!\w)",
+        flags=re.IGNORECASE,
+    )
+
+
 def run_low_scancode_topic_modelling(
-    input_directory: Path,
+    input_directory: Path | str,
     *,
     output_directory: Path | None = None,
     score_threshold: float = _DEFAULT_SCORE_THRESHOLD,
+    prefilter_keywords: Iterable[str] | None = None,
     dataset_names: Iterable[str] | None = None,
     languages: Iterable[str] | None = None,
     max_shards: int | None = None,
@@ -427,7 +590,9 @@ def run_low_scancode_topic_modelling(
     ScanCode scores in this project are stored on a 0-100 scale, but this
     function accepts either 0.95-style ratio thresholds or 95-style percentage
     thresholds. Scores read from inputs are normalized the same way before
-    filtering.
+    filtering. When ``prefilter_keywords`` are supplied, only low-score
+    comments containing at least one case-insensitive whole word or literal
+    phrase are passed to BERTopic.
     """
 
     if batch_size < 1:
@@ -445,11 +610,24 @@ def run_low_scancode_topic_modelling(
     if max_shards is not None and max_shards < 1:
         raise ValueError(f"max_shards must be >= 1, got {max_shards}")
 
-    input_directory = input_directory.resolve()
-    if not input_directory.exists() or not input_directory.is_dir():
-        raise ValueError(f"Input ScanCode output directory does not exist: {input_directory}")
+    normalized_prefilter_keywords = _normalize_prefilter_keywords(prefilter_keywords)
+    keyword_prefilter = _compile_keyword_prefilter(normalized_prefilter_keywords)
+
+    input_source = input_directory
+    is_huggingface_source = (
+        isinstance(input_source, str)
+        and "/" in input_source
+        and not Path(input_source).expanduser().exists()
+    )
+    input_directory = _resolve_topic_modelling_input(
+        input_source,
+        dataset_names=dataset_names,
+        languages=languages,
+    )
 
     normalized_threshold = _normalize_score(score_threshold)
+    if output_directory is None and is_huggingface_source:
+        output_directory = Path.cwd() / f"{input_source.rsplit('/', 1)[-1]}-topic-modelling"
     output_directory = (
         output_directory
         or input_directory.parent / f"{input_directory.name}-topic-modelling"
@@ -468,6 +646,7 @@ def run_low_scancode_topic_modelling(
     loaded = _load_low_score_comments(
         input_directory,
         score_threshold=normalized_threshold,
+        keyword_prefilter=keyword_prefilter,
         dataset_names=dataset_names,
         languages=languages,
         max_shards=max_shards,
@@ -482,8 +661,11 @@ def run_low_scancode_topic_modelling(
         records_seen=loaded.records_seen,
         records_missing_score=loaded.records_missing_score,
         records_without_comment=loaded.records_without_comment,
+        records_before_keyword_prefilter=loaded.records_before_keyword_prefilter,
+        records_prefiltered_out=loaded.records_prefiltered_out,
         records_selected=len(loaded.comments),
         shards_read=loaded.shards_read,
+        prefilter_keywords=normalized_prefilter_keywords,
     )
 
     assignments_path = output_directory / "topic-assignments.parquet"
@@ -647,6 +829,7 @@ def _load_low_score_comments(
     input_directory: Path,
     *,
     score_threshold: float,
+    keyword_prefilter: Pattern[str] | None,
     dataset_names: Iterable[str] | None,
     languages: Iterable[str] | None,
     max_shards: int | None,
@@ -674,6 +857,7 @@ def _load_low_score_comments(
             input_directory,
             loaded,
             score_threshold=score_threshold,
+            keyword_prefilter=keyword_prefilter,
             batch_size=batch_size,
             dataset_filter=dataset_filter,
             language_filter=language_filter,
@@ -687,6 +871,7 @@ def _load_parquet_low_score_comments(
     loaded: _LoadedComments,
     *,
     score_threshold: float,
+    keyword_prefilter: Pattern[str] | None,
     batch_size: int,
     dataset_filter: set[str],
     language_filter: set[str],
@@ -700,6 +885,7 @@ def _load_parquet_low_score_comments(
                 payload,
                 loaded,
                 score_threshold=score_threshold,
+                keyword_prefilter=keyword_prefilter,
                 dataset_filter=dataset_filter,
                 language_filter=language_filter,
                 source_path=relative_path,
@@ -714,6 +900,7 @@ def _maybe_add_low_score_comment(
     loaded: _LoadedComments,
     *,
     score_threshold: float,
+    keyword_prefilter: Pattern[str] | None,
     dataset_filter: set[str],
     language_filter: set[str],
     source_path: str,
@@ -742,10 +929,16 @@ def _maybe_add_low_score_comment(
         loaded.records_without_comment += 1
         return
 
+    text = str(text)
+    loaded.records_before_keyword_prefilter += 1
+    if keyword_prefilter is not None and keyword_prefilter.search(text) is None:
+        loaded.records_prefiltered_out += 1
+        return
+
     loaded.comments.append(
         _SelectedComment(
             ordinal=len(loaded.comments),
-            text=str(text),
+            text=text,
             source_path=source_path,
             source_row_index=source_row_index,
             payload=payload,
@@ -763,13 +956,22 @@ def _build_bertopic_model(
 ) -> Any:
     try:
         from bertopic import BERTopic
+        from sklearn.feature_extraction.text import CountVectorizer
     except ImportError as exc:
         raise RuntimeError(
             "BERTopic is not installed. Run `uv sync` or `uv add bertopic` before topic modelling."
         ) from exc
     kwargs = {
+        "language": "english",
         "min_topic_size": min_topic_size,
         "calculate_probabilities": calculate_probabilities,
+        "seed_topic_list": [list(phrases) for phrases in SEED_TOPICS.values()],
+        "vectorizer_model": CountVectorizer(
+            lowercase=True,
+            ngram_range=(1, 3),
+            min_df=2,
+            stop_words=None,
+        ),
     }
     kwargs.update(model_kwargs)
     return BERTopic(**kwargs)
@@ -880,6 +1082,8 @@ def _write_topic_modelling_manifest(
         "records_seen": stats.records_seen,
         "records_missing_score": stats.records_missing_score,
         "records_without_comment": stats.records_without_comment,
+        "records_before_keyword_prefilter": stats.records_before_keyword_prefilter,
+        "records_prefiltered_out": stats.records_prefiltered_out,
         "records_selected": stats.records_selected,
         "records_modelled": stats.records_modelled,
         "topics_discovered": stats.topics_discovered,
@@ -887,6 +1091,11 @@ def _write_topic_modelling_manifest(
         "shards_read": stats.shards_read,
         "dataset_filter": sorted(dataset_names),
         "language_filter": sorted(languages),
+        "keyword_prefilter": {
+            "enabled": bool(stats.prefilter_keywords),
+            "keywords": list(stats.prefilter_keywords),
+            "match_mode": "any_case_insensitive_whole_word_or_phrase",
+        },
         "bertopic": bertopic_config,
         "assignments_path": str(stats.assignments_path) if stats.assignments_path else None,
         "topics_path": str(stats.topics_path) if stats.topics_path else None,
@@ -1137,11 +1346,10 @@ def _run_codex_exec(
     command = [
         *shlex.split(codex_command),
         "exec",
+        "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
-        "never",
     ]
     if codex_model:
         command.extend(["--model", codex_model])

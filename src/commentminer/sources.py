@@ -5,6 +5,9 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import gzip
+import hashlib
+import io
+import json
 import logging
 from pathlib import Path, PurePosixPath
 import random
@@ -18,9 +21,11 @@ try:
 except ImportError:  # pragma: no cover - resource is unavailable on Windows.
     resource = None  # type: ignore[assignment]
 
+from huggingface_hub import hf_hub_download
 import httpx
 import pyarrow.parquet as pq
 from tqdm.auto import tqdm
+import zstandard
 
 from .config import DatasetSpec, PipelineConfig
 from .downloader import HuggingFaceDownloader, RemoteFile
@@ -90,7 +95,24 @@ class HuggingFaceParquetSource:
         download_workers: int | None = None,
         cache_source_files: bool | None = None,
     ) -> None:
+        partition_count = int(dataset.extra.get("file_partition_count", 1))
+        partition_index = int(dataset.extra.get("file_partition_index", 0))
         self.name = _source_run_name(dataset.name, language)
+        self.processed_checkpoint_namespace = _PROCESSED_CHECKPOINT_NAMESPACE
+        if partition_count > 1:
+            partition_label = f"part-{partition_index:05d}-of-{partition_count:05d}"
+            language_label = ""
+            if language == "c++":
+                language_digest = hashlib.sha256(language.encode("utf-8")).hexdigest()[
+                    :8
+                ]
+                language_label = f"__lang-{language_digest}"
+            self.name = f"{self.name}{language_label}__{partition_label}"
+            checkpoint_language_label = language_label.replace("__", "-")
+            self.processed_checkpoint_namespace = (
+                f"{_PROCESSED_CHECKPOINT_NAMESPACE}{checkpoint_language_label}-"
+                f"{partition_label}"
+            )
         self.config = config
         self.dataset = dataset
         self.language = language
@@ -154,7 +176,7 @@ class HuggingFaceParquetSource:
             language=self.language,
             token=self.token,
             max_files=self.max_files,
-            checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
+            checkpoint_namespace=self.processed_checkpoint_namespace,
         )
 
         with _RemoteDownloadScheduler(self, plan.pending_files) as downloads:
@@ -176,7 +198,7 @@ class HuggingFaceParquetSource:
                             self.dataset,
                             remote.path,
                             language=self.language,
-                            checkpoint_namespace=_PROCESSED_CHECKPOINT_NAMESPACE,
+                            checkpoint_namespace=self.processed_checkpoint_namespace,
                         )
                         resume_cursor = None
                         _LOGGER.info(
@@ -293,6 +315,10 @@ class HuggingFaceParquetSource:
         metadata["row_index"] = row_index
         if self.language is not None:
             metadata["selected_language"] = self.language
+        if path is not None and not metadata.get("ext"):
+            extension = PurePosixPath(str(path)).suffix.lstrip(".").lower()
+            if extension:
+                metadata["ext"] = extension
 
         return InputRecord(
             dataset=self.dataset.name,
@@ -324,6 +350,291 @@ class HuggingFaceParquetSource:
 
 class TheStackParquetSource(HuggingFaceParquetSource):
     """Backward-compatible name for the original parquet source adapter."""
+
+
+class HuggingFaceGzipJsonlSource(HuggingFaceParquetSource):
+    """Stream records from gzip-compressed JSON Lines Hub shards."""
+
+    def _iter_file_records(
+        self,
+        remote: RemoteFile,
+        local_path: Any,
+        resume_cursor: ShardRowCursor | None,
+    ) -> Iterator[InputRecord]:
+        start_row = self._start_row_for_remote(remote, resume_cursor)
+        with gzip.open(local_path, mode="rt", encoding="utf-8") as stream:
+            for row_index, line in enumerate(stream):
+                if row_index < start_row or not line.strip():
+                    continue
+                row = json.loads(line)
+                yield self._row_to_input_record(remote.path, row_index, row)
+
+
+class RedPajamaV1GitHubSource:
+    """Stream RedPajama-Data-1T GitHub JSONL shards listed by its Hub manifest."""
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        dataset: DatasetSpec,
+        *,
+        language: str | None = None,
+        show_progress: bool = True,
+        token: str | bool | None = None,
+        max_files: int | None = None,
+        prefetch_files: int | None = None,
+        download_workers: int | None = None,
+        manifest_urls: Sequence[str] | None = None,
+    ) -> None:
+        self.name = _source_run_name(dataset.name, language)
+        self.config = config
+        self.dataset = dataset
+        self.language = language
+        self.show_progress = show_progress
+        self.token = token
+        self.max_files = max_files
+        self.prefetch_files = _positive_int_option(
+            prefetch_files,
+            dataset.extra.get("prefetch_files"),
+            default=_DEFAULT_PREFETCH_FILES,
+        )
+        self.download_workers = _positive_int_option(
+            download_workers,
+            dataset.extra.get("download_workers"),
+            default=_DEFAULT_DOWNLOAD_WORKERS,
+        )
+        self.manifest_path = str(dataset.extra.get("manifest_path", "urls/github.txt"))
+        self.request_timeout_seconds = float(
+            dataset.extra.get("request_timeout_seconds", 120)
+        )
+        self.read_retries = int(dataset.extra.get("read_retries", 5))
+        self.retry_backoff_seconds = float(
+            dataset.extra.get("retry_backoff_seconds", 2)
+        )
+        self._manifest_urls = list(manifest_urls) if manifest_urls is not None else None
+
+    def iter_records(self, start_after: str | None = None) -> Iterator[InputRecord]:
+        self.config.ensure_directories()
+        resume_cursor = ShardRowCursor.parse(start_after) if start_after else None
+        urls = self._load_manifest_urls()
+        if self.max_files is not None:
+            urls = urls[: self.max_files]
+
+        resume_found = resume_cursor is None
+        selected_urls: list[str] = []
+        for url in urls:
+            if not resume_found:
+                if self._remote_path(url) != resume_cursor.remote_path:
+                    continue
+                resume_found = True
+            selected_urls.append(url)
+
+        _LOGGER.info(
+            "Preparing RedPajama source iteration dataset=%s shards=%s "
+            "prefetch_files=%s download_workers=%s",
+            self.dataset.name,
+            len(selected_urls),
+            self.prefetch_files,
+            self.download_workers,
+        )
+
+        progress = tqdm(
+            total=len(selected_urls),
+            desc=f"{self.dataset.name} shards",
+            unit="shards",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+        )
+        try:
+            with _RedPajamaDownloadScheduler(self, selected_urls) as downloads:
+                for url, local_path in downloads:
+                    remote_path = self._remote_path(url)
+                    start_row = (
+                        resume_cursor.row_index + 1
+                        if resume_cursor is not None
+                        and resume_cursor.remote_path == remote_path
+                        else 0
+                    )
+                    try:
+                        yield from self._iter_local_records(
+                            local_path,
+                            remote_path,
+                            start_row,
+                        )
+                        resume_cursor = None
+                        progress.update(1)
+                    finally:
+                        local_path.unlink(missing_ok=True)
+        finally:
+            progress.close()
+
+        if not resume_found and start_after is not None:
+            raise ValueError(
+                f"Resume record '{start_after}' does not belong to the selected "
+                f"{self.dataset.name} manifest files"
+            )
+
+    def _load_manifest_urls(self) -> list[str]:
+        if self._manifest_urls is not None:
+            return list(self._manifest_urls)
+        manifest = hf_hub_download(
+            repo_id=self.dataset.resolve_repo_id(),
+            filename=self.manifest_path,
+            repo_type=self.dataset.repo_type,
+            revision=self.dataset.revision,
+            cache_dir=self.config.storage.huggingface_cache_directory,
+            token=self.token,
+        )
+        return [
+            line.strip()
+            for line in Path(manifest).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    def _iter_url_records(
+        self,
+        url: str,
+        remote_path: str,
+        start_row: int,
+    ) -> Iterator[InputRecord]:
+        next_row = start_row
+        for attempt in range(self.read_retries + 1):
+            try:
+                with httpx.stream(
+                    "GET",
+                    url,
+                    follow_redirects=True,
+                    timeout=self.request_timeout_seconds,
+                ) as response:
+                    response.raise_for_status()
+                    for row_index, line in enumerate(response.iter_lines()):
+                        if row_index < next_row or not line.strip():
+                            continue
+                        row = json.loads(line)
+                        yield self._row_to_input_record(remote_path, row_index, row)
+                        next_row = row_index + 1
+                return
+            except (httpx.HTTPError, json.JSONDecodeError):
+                if attempt >= self.read_retries:
+                    raise
+                time.sleep(self.retry_backoff_seconds * (2**attempt))
+
+    def _download_url(self, url: str) -> Path:
+        remote_path = self._remote_path(url)
+        target = (
+            self.config.storage.download_directory
+            / self.dataset.name
+            / "redpajama-prefetch"
+            / PurePosixPath(remote_path).name
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(f"{target.name}.part")
+        for attempt in range(self.read_retries + 1):
+            try:
+                with (
+                    httpx.stream(
+                        "GET",
+                        url,
+                        follow_redirects=True,
+                        timeout=self.request_timeout_seconds,
+                    ) as response,
+                    partial.open("wb") as output,
+                ):
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes():
+                        output.write(chunk)
+                partial.replace(target)
+                return target
+            except httpx.HTTPError:
+                partial.unlink(missing_ok=True)
+                if attempt >= self.read_retries:
+                    raise
+                time.sleep(self.retry_backoff_seconds * (2**attempt))
+        raise AssertionError("unreachable")
+
+    def _iter_local_records(
+        self,
+        local_path: Path,
+        remote_path: str,
+        start_row: int,
+    ) -> Iterator[InputRecord]:
+        with local_path.open("rt", encoding="utf-8") as stream:
+            for row_index, line in enumerate(stream):
+                if row_index < start_row or not line.strip():
+                    continue
+                yield self._row_to_input_record(remote_path, row_index, json.loads(line))
+
+    def _row_to_input_record(
+        self,
+        remote_path: str,
+        row_index: int,
+        row: dict[str, Any],
+    ) -> InputRecord:
+        meta_value = row.get("meta")
+        meta = dict(meta_value) if isinstance(meta_value, dict) else {}
+        path = _optional_string(meta.get("path"))
+        repo = _optional_string(meta.get("repo_name"))
+        extension = PurePosixPath(path).suffix.lstrip(".").lower() if path else None
+        metadata = dict(meta)
+        metadata["remote_path"] = remote_path
+        metadata["row_index"] = row_index
+        metadata["red_pajama_subset"] = row.get("red_pajama_subset", "github")
+        if extension:
+            metadata["ext"] = extension
+
+        return InputRecord(
+            dataset=self.dataset.name,
+            record_id=ShardRowCursor(remote_path, row_index).to_record_id(),
+            content=str(row.get("text") or ""),
+            language=self.language,
+            path=path,
+            repo=repo,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _remote_path(url: str) -> str:
+        name = PurePosixPath(urlparse(url).path).name
+        if not name:
+            raise ValueError(f"RedPajama manifest URL has no filename: {url}")
+        return f"github/{name}"
+
+
+class PileGitHubZstdJsonlSource(HuggingFaceParquetSource):
+    """Read only the Github component from Pile Zstandard JSONL shards."""
+
+    def _iter_file_records(
+        self,
+        remote: RemoteFile,
+        local_path: Any,
+        resume_cursor: ShardRowCursor | None,
+    ) -> Iterator[InputRecord]:
+        start_row = self._start_row_for_remote(remote, resume_cursor)
+        pile_set_name = str(self.dataset.extra.get("pile_set_name", "Github"))
+        with (
+            Path(local_path).open("rb") as compressed,
+            zstandard.ZstdDecompressor().stream_reader(compressed) as reader,
+            io.TextIOWrapper(reader, encoding="utf-8") as text_stream,
+        ):
+            for row_index, line in enumerate(text_stream):
+                if row_index < start_row or not line.strip():
+                    continue
+                row = json.loads(line)
+                meta_value = row.get("meta")
+                meta = dict(meta_value) if isinstance(meta_value, dict) else {}
+                if meta.get("pile_set_name") != pile_set_name:
+                    continue
+                metadata = dict(meta)
+                metadata["remote_path"] = remote.path
+                metadata["row_index"] = row_index
+                metadata["detect_language_from_content"] = True
+                yield InputRecord(
+                    dataset=self.dataset.name,
+                    record_id=ShardRowCursor(remote.path, row_index).to_record_id(),
+                    content=str(row.get("text") or ""),
+                    metadata=metadata,
+                )
 
 
 class StackV2ContentFetcher(Protocol):
@@ -1459,6 +1770,62 @@ class StackV2SWHContentSource(HuggingFaceParquetSource):
             repo=record.repo,
             metadata=metadata,
         )
+
+
+class _RedPajamaDownloadScheduler:
+    def __init__(self, source: RedPajamaV1GitHubSource, urls: Sequence[str]) -> None:
+        self.source = source
+        self.url_iter = iter(urls)
+        self.executor: ThreadPoolExecutor | None = None
+        self.pending: deque[tuple[str, Future[Path]]] = deque()
+
+    def __enter__(self) -> "_RedPajamaDownloadScheduler":
+        if self.source.prefetch_files > 1 and self.source.download_workers > 1:
+            self.executor = ThreadPoolExecutor(
+                max_workers=min(self.source.download_workers, self.source.prefetch_files),
+                thread_name_prefix="commentminer-redpajama-download",
+            )
+        self._fill()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        for _, future in self.pending:
+            future.cancel()
+        if self.executor is not None:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        while self.pending:
+            _, future = self.pending.popleft()
+            if future.cancelled() or not future.done():
+                continue
+            try:
+                future.result().unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def __iter__(self) -> "_RedPajamaDownloadScheduler":
+        return self
+
+    def __next__(self) -> tuple[str, Path]:
+        if self.executor is None:
+            url = next(self.url_iter)
+            return url, self.source._download_url(url)
+        self._fill()
+        if not self.pending:
+            raise StopIteration
+        url, future = self.pending.popleft()
+        return url, future.result()
+
+    def _fill(self) -> None:
+        if self.executor is None:
+            return
+        while len(self.pending) < self.source.prefetch_files:
+            try:
+                url = next(self.url_iter)
+            except StopIteration:
+                return
+            self.pending.append(
+                (url, self.executor.submit(self.source._download_url, url))
+            )
 
 
 class _RemoteDownloadScheduler:

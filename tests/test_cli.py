@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from commentminer.cli import build_parser, main
+from commentminer.topic_modelling import SHARING_PREFILTER_KEYWORDS
 
 
 class CliTests(unittest.TestCase):
@@ -19,6 +20,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("mine-dataset", commands)
         self.assertIn("export-hf-dataset", commands)
         self.assertIn("scan-hf-comment-licenses", commands)
+        self.assertIn("build-classifier-dataset", commands)
+        self.assertIn("verify-classifier-dataset", commands)
         self.assertIn("build-redistribution-candidate-dataset", commands)
         self.assertIn("verify-redistribution-candidate-dataset", commands)
         self.assertNotIn("aggregate-comment-runs", commands)
@@ -42,6 +45,53 @@ class CliTests(unittest.TestCase):
                     "anything",
                 ]
             )
+
+    def test_topic_modelling_parser_accepts_repeatable_keyword_prefilter_options(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "topic-model-low-scancode",
+                "input",
+                "--prefilter-keyword",
+                "share",
+                "--prefilter-keyword",
+                "private and confidential",
+                "--sharing-prefilter",
+            ]
+        )
+
+        self.assertEqual(
+            args.prefilter_keywords,
+            ["share", "private and confidential"],
+        )
+        self.assertTrue(args.sharing_prefilter)
+
+        defaults = parser.parse_args(["topic-model-low-scancode", "input"])
+        self.assertIsNone(defaults.prefilter_keywords)
+        self.assertFalse(defaults.sharing_prefilter)
+
+    def test_topic_modelling_cli_combines_sharing_and_custom_prefilter_keywords(self) -> None:
+        stats = Mock(model_path=None, codex_judge_report_path=None)
+        with patch(
+            "commentminer.cli.run_low_scancode_topic_modelling", return_value=stats
+        ) as run_topic_modelling, redirect_stdout(StringIO()):
+            exit_code = main(
+                [
+                    "topic-model-low-scancode",
+                    "input",
+                    "--sharing-prefilter",
+                    "--prefilter-keyword",
+                    "bespoke phrase",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        run_topic_modelling.assert_called_once()
+        self.assertEqual(
+            run_topic_modelling.call_args.kwargs["prefilter_keywords"],
+            [*SHARING_PREFILTER_KEYWORDS, "bespoke phrase"],
+        )
 
     def test_redistribution_candidate_parser_has_reproducible_defaults(self) -> None:
         parser = build_parser()
@@ -182,6 +232,183 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("artifact hash mismatch", stdout.getvalue())
+
+    def test_classifier_dataset_cli_parses_matrix_and_judge_controls(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "build-classifier-dataset",
+                "input",
+                "output",
+                "--combination",
+                "the-stack:Python",
+                "--combination",
+                "the-heap:Java",
+                "--judge-passes",
+                "2",
+                "--judge-workers",
+                "3",
+            ]
+        )
+
+        self.assertEqual(
+            args.combination,
+            ["the-stack:Python", "the-heap:Java"],
+        )
+        self.assertEqual(args.judge_passes, 2)
+        self.assertEqual(args.judge_workers, 3)
+
+    def test_classifier_dataset_cli_parses_global_plan_and_cache_controls(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "build-classifier-dataset",
+                "input",
+                "output",
+                "--combination",
+                "the-stack:Python",
+                "--target-per-class",
+                "5000",
+                "--candidate-target",
+                "sharing_restriction=15000",
+                "--candidate-target",
+                "irrelevant=6500",
+                "--candidate-pool-multiplier",
+                "9",
+                "--max-candidates-per-pool",
+                "120000",
+                "--all-shards",
+                "--judge-cache-epoch",
+                "production-v1",
+                "--candidate-plan",
+                "plan",
+                "--progress-every-shards",
+                "50",
+                "--progress-every-judge-batches",
+                "20",
+            ]
+        )
+        self.assertEqual(args.target_per_class, 5000)
+        self.assertIsNone(args.target_per_combination)
+        self.assertEqual(
+            args.candidate_target,
+            ["sharing_restriction=15000", "irrelevant=6500"],
+        )
+        self.assertEqual(args.candidate_pool_multiplier, 9)
+        self.assertEqual(args.max_candidates_per_pool, 120000)
+        self.assertTrue(args.all_shards)
+        self.assertEqual(args.judge_cache_epoch, "production-v1")
+        self.assertEqual(str(args.candidate_plan), "plan")
+        self.assertEqual(args.progress_every_shards, 50)
+        self.assertEqual(args.progress_every_judge_batches, 20)
+
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "build-classifier-dataset",
+                    "input",
+                    "output",
+                    "--combination",
+                    "the-stack:Python",
+                    "--target-per-class",
+                    "5000",
+                    "--target-per-combination",
+                    "25",
+                ]
+            )
+
+    def test_classifier_dataset_cli_dispatches_parsed_combinations(self) -> None:
+        stats = Mock(
+            input_directory="input",
+            output_directory="output",
+            combinations_found=2,
+            combinations_requested=2,
+            shards_scanned=2,
+            records_scanned=20,
+            candidates_selected=12,
+            accepted=6,
+            rejected=6,
+            judge_calls=2,
+            judge_cache_hits=0,
+            dataset_path="output/dataset.parquet",
+            manifest_path="output/manifest.json",
+            verification_path="output/verification.json",
+        )
+        with patch(
+            "commentminer.cli.build_classifier_dataset", return_value=stats
+        ) as build_dataset, redirect_stdout(StringIO()):
+            exit_code = main(
+                [
+                    "build-classifier-dataset",
+                    "input",
+                    "output",
+                    "--combination",
+                    "the-stack:Python",
+                    "--combination",
+                    "the-heap:Java",
+                    "--target-per-class",
+                    "5000",
+                    "--candidate-target",
+                    "sharing_restriction=15000",
+                    "--judge-cache-epoch",
+                    "production-v1",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            build_dataset.call_args.kwargs["combinations"],
+            [("the-stack", "Python"), ("the-heap", "Java")],
+        )
+        self.assertEqual(
+            build_dataset.call_args.kwargs["target_per_class"],
+            5000,
+        )
+        self.assertEqual(
+            build_dataset.call_args.kwargs["candidate_targets"],
+            {"sharing_restriction": 15000},
+        )
+        self.assertEqual(
+            build_dataset.call_args.kwargs["judge_cache_epoch"],
+            "production-v1",
+        )
+
+    def test_classifier_dataset_cli_scan_only_prints_plan_without_dataset_fields(self) -> None:
+        stats = Mock(
+            input_directory="input",
+            output_directory="plan",
+            combinations_found=1,
+            combinations_requested=1,
+            shards_scanned=4,
+            records_scanned=100,
+            candidates_selected=30,
+            candidates_path="plan/candidates.parquet",
+            manifest_path="plan/candidate-plan.json",
+        )
+        with patch(
+            "commentminer.cli.build_classifier_dataset",
+            return_value=stats,
+        ) as build_dataset, redirect_stdout(StringIO()) as stdout:
+            exit_code = main(
+                [
+                    "build-classifier-dataset",
+                    "input",
+                    "plan",
+                    "--combination",
+                    "the-stack:Python",
+                    "--target-per-class",
+                    "5",
+                    "--scan-only",
+                    "--all-shards",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(build_dataset.call_args.kwargs["scan_only"])
+        self.assertIsNone(
+            build_dataset.call_args.kwargs["max_shards_per_combination"]
+        )
+        self.assertIn("Candidate plan: plan/candidate-plan.json", stdout.getvalue())
 
 
 if __name__ == "__main__":

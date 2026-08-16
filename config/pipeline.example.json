@@ -76,89 +76,32 @@
         "repo_columns": ["repo_name"],
         "metadata_columns": ["blob_id", "src_encoding", "language", "gha_language", "extension", "path", "repo_name"],
         "prefetch_files": 4,
-        "download_workers": 4,
-        "extraction_workers": 4,
-        "extraction_buffer": 16,
+        "download_workers": 64,
+        "extraction_workers": 1,
+        "extraction_buffer": 1,
         "cache_source_files": false,
-        "notes": "The Stack v2 Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from the public Software Heritage S3 HTTP endpoint with aiohttp by default. Package-process mining duplicates bounded aiohttp pools across disjoint ID packages to use multiple CPU cores while keeping total content concurrency capped; accept the HF terms and authenticate with Hugging Face when needed."
+        "notes": "The full Stack v2 Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from the public Software Heritage S3 HTTP endpoint with aiohttp by default. Accept the HF terms and authenticate with Hugging Face when needed."
       }
     },
     {
-      "name": "the-stack-v2-dedup",
-      "source": "huggingface_hub",
-      "repo_id": "bigcode/the-stack-v2-dedup",
-      "repo_type": "dataset",
+      "name": "the-stack-v3-full",
+      "source": "huggingface_bucket",
+      "repo_id": "HuggingFaceCode/stack-v3-full",
+      "repo_type": "bucket",
       "revision": "main",
       "split": "train",
       "streaming": true,
-      "enabled": true,
+      "enabled": false,
       "batch_size": 1000,
       "allow_patterns": [
-        "data/{language}/**"
-      ],
-      "ignore_patterns": [
-        "**/.gitattributes",
-        "**/README.md"
+        "contents/language={language}/**/*.parquet"
       ],
       "extra": {
-        "content_backend": "softwareheritage_s3",
-        "blob_id_column": "blob_id",
-        "src_encoding_column": "src_encoding",
-        "swh_content_client": "aiohttp",
-        "swh_content_url_template": "http://softwareheritage.s3.amazonaws.com/content/{blob_id}",
-        "swh_content_compression": ".gz",
-        "package_worker_backend": "process",
-        "swh_s3_max_pool_connections": 1024,
-        "swh_s3_read_retries": 6,
-        "swh_s3_retry_backoff_seconds": 0.25,
-        "content_download_workers": 2048,
-        "content_prefetch_records": 20000,
-        "swh_skip_missing_content": true,
-        "aws_unsigned": true,
-        "content_columns": ["content", "text"],
-        "language_columns": ["language", "gha_language", "extension"],
-        "path_columns": ["path"],
-        "repo_columns": ["repo_name"],
-        "metadata_columns": ["blob_id", "src_encoding", "language", "gha_language", "extension", "path", "repo_name"],
-        "prefetch_files": 4,
-        "download_workers": 4,
-        "extraction_workers": 4,
-        "extraction_buffer": 16,
-        "cache_source_files": false,
-        "notes": "The Stack v2 dedup Hub parquet shards contain Software Heritage blob IDs, not source text. Mining fetches gzipped file contents from the public Software Heritage S3 HTTP endpoint with aiohttp by default. Accept the HF terms and authenticate with Hugging Face when needed."
-      }
-    },
-    {
-      "name": "starcoderdata",
-      "source": "huggingface_hub",
-      "repo_id": "bigcode/starcoderdata",
-      "repo_type": "dataset",
-      "revision": "main",
-      "split": "train",
-      "streaming": true,
-      "enabled": true,
-      "batch_size": 1000,
-      "allow_patterns": [
-        "{language}/**"
-      ],
-      "ignore_patterns": [
-        ".gitattributes",
-        "README.md",
-        "git-commits-cleaned/**",
-        "github-issues-filtered-structured/**",
-        "jupyter-scripts-dedup-filtered/**",
-        "jupyter-structured-clean-dedup/**"
-      ],
-      "extra": {
-        "content_columns": ["content", "text"],
-        "language_columns": ["lang", "language", "ext"],
-        "path_columns": ["max_stars_repo_path", "max_issues_repo_path", "max_forks_repo_path", "path"],
-        "repo_columns": ["max_stars_repo_name", "max_issues_repo_name", "max_forks_repo_name", "repo_name"],
-        "prefetch_files": 4,
-        "download_workers": 4,
-        "extraction_workers": 4,
-        "extraction_buffer": 16,
-        "cache_source_files": false
+        "source_format": "stack_v3_bucket",
+        "listing_workers": 64,
+        "shard_workers": 64,
+        "min_free_gb": 20,
+        "notes": "The complete Stack v3 corpus is an HF Storage Bucket. It is excluded from generic mine-config runs and handled by the dedicated runner, which downloads independent content Parquet shards, extracts opening comments, records completion, and deletes each source shard."
       }
     },
     {
@@ -189,6 +132,156 @@
         "extraction_buffer": 16,
         "cache_source_files": false,
         "notes": "Public parquet dataset. Language names use dataset casing such as ANTLR, Python, C++, and C#."
+      }
+    },
+    {
+      "name": "redpajama-v1-github",
+      "source": "huggingface_hub",
+      "repo_id": "togethercomputer/RedPajama-Data-1T",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "urls/github.txt"
+      ],
+      "extra": {
+        "source_format": "redpajama_v1_github",
+        "manifest_path": "urls/github.txt",
+        "request_timeout_seconds": 120,
+        "read_retries": 5,
+        "retry_backoff_seconds": 2,
+        "prefetch_files": 8,
+        "download_workers": 8,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "notes": "Streams the V1 GitHub JSONL shards from the URLs in the Hub manifest. Programming language is inferred from each source path extension; shard payloads are not retained."
+      }
+    },
+    {
+      "name": "pile-uncopyrighted-github",
+      "source": "huggingface_hub",
+      "repo_id": "monology/pile-uncopyrighted",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "train/*.jsonl.zst"
+      ],
+      "ignore_patterns": [
+        ".gitattributes",
+        "README.md",
+        "test.jsonl.zst",
+        "val.jsonl.zst"
+      ],
+      "extra": {
+        "source_format": "pile_github_zstd_jsonl",
+        "pile_set_name": "Github",
+        "prefetch_files": 4,
+        "download_workers": 4,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "Prefetches up to four approximately 11 GB Zstandard JSONL shards concurrently, retains only records whose meta.pile_set_name is Github, infers their language from content because the Pile omitted source paths, and deletes each local shard after processing."
+      }
+    },
+    {
+      "name": "codeparrot-clean-valid",
+      "source": "huggingface_hub",
+      "repo_id": "codeparrot/codeparrot-clean-valid",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "*.json.gz"
+      ],
+      "ignore_patterns": [
+        ".gitattributes",
+        "README.md"
+      ],
+      "extra": {
+        "source_format": "gzip_jsonl",
+        "content_columns": ["content"],
+        "path_columns": ["path"],
+        "repo_columns": ["repo_name"],
+        "prefetch_files": 1,
+        "download_workers": 1,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "The 61,373-record validation split of cleaned Python files. Language is inferred from path extensions and the single 142 MB gzip JSONL shard is removed after processing."
+      }
+    },
+    {
+      "name": "codeparrot-github-code",
+      "source": "huggingface_hub",
+      "repo_id": "codeparrot/github-code",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "data/*.parquet"
+      ],
+      "ignore_patterns": [
+        ".gitattributes",
+        "README.md",
+        "github-code.py"
+      ],
+      "extra": {
+        "content_columns": ["content", "code"],
+        "language_columns": ["language"],
+        "path_columns": ["path"],
+        "repo_columns": ["repo_name"],
+        "metadata_columns": ["language", "path", "repo_name", "license", "size"],
+        "prefetch_files": 2,
+        "download_workers": 2,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "Processes the repository's 1,126 native Parquet shards directly and removes each local shard after processing. The current native shards store source in content and omit language, so language is inferred from path extensions; code and language remain configured as compatibility fallbacks."
+      }
+    },
+    {
+      "name": "code-clippy-github",
+      "source": "huggingface_hub",
+      "repo_id": "CodedotAI/code_clippy_github",
+      "repo_type": "dataset",
+      "revision": "main",
+      "split": "train",
+      "streaming": true,
+      "enabled": true,
+      "batch_size": 1000,
+      "allow_patterns": [
+        "github-dedup-*.json.gz"
+      ],
+      "ignore_patterns": [
+        ".gitattributes",
+        "README.md",
+        "code_clippy_github.py"
+      ],
+      "extra": {
+        "source_format": "gzip_jsonl",
+        "content_columns": ["content", "code_text"],
+        "language_columns": ["language"],
+        "path_columns": ["path", "file_path"],
+        "repo_columns": ["repo_name"],
+        "prefetch_files": 2,
+        "download_workers": 2,
+        "extraction_workers": 4,
+        "extraction_buffer": 16,
+        "cache_source_files": false,
+        "notes": "Processes approximately 50,000 deduplicated gzip JSONL shards one at a time and removes each local shard after processing. Current shards store source in content and paths in path, and omit language, so language is inferred from path extensions; code_text, file_path, and language remain compatibility fallbacks."
       }
     }
   ],

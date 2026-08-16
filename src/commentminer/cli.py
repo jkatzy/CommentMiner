@@ -10,6 +10,11 @@ from typing import Callable, Sequence
 
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+from .classifier_dataset import (
+    CLASS_LABELS,
+    build_classifier_dataset,
+    verify_classifier_dataset,
+)
 from .config import PipelineConfig
 from .downloader import HuggingFaceDownloader
 from .encoding_benchmark import (
@@ -41,9 +46,19 @@ from .redistribution_candidates import (
     verify_redistribution_candidates,
 )
 from .redistribution_judge import SUPPORTED_REASONING_EFFORTS
-from .sources import HuggingFaceParquetSource, StackV2SWHContentSource
+from .sources import (
+    HuggingFaceGzipJsonlSource,
+    HuggingFaceParquetSource,
+    PileGitHubZstdJsonlSource,
+    RedPajamaV1GitHubSource,
+    StackV2SWHContentSource,
+)
 from .stackv2_packages import mine_stack_v2_id_packages
-from .topic_modelling import run_low_scancode_topic_modelling
+from .stackv3_bucket import StackV3MemorySafeguardError, mine_stack_v3_bucket_shards
+from .topic_modelling import (
+    SHARING_PREFILTER_KEYWORDS,
+    run_low_scancode_topic_modelling,
+)
 
 
 _DEFAULT_EXTRACTION_WORKERS = 4
@@ -120,6 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--token-env")
     mine.add_argument("--max-records", type=int)
     mine.add_argument("--max-files", type=int)
+    mine.add_argument("--file-partition-count", type=int, default=1)
+    mine.add_argument("--file-partition-index", type=int, default=0)
     mine.add_argument("--max-comment-start-row", type=int, default=10)
     mine.add_argument(
         "--prefetch-files",
@@ -299,7 +316,13 @@ def build_parser() -> argparse.ArgumentParser:
         "topic-model-low-scancode",
         help="Run BERTopic over comments with ScanCode scores below a threshold.",
     )
-    topic_modelling.add_argument("input_directory", type=Path)
+    topic_modelling.add_argument(
+        "input_directory",
+        help=(
+            "Local ScanCode Parquet directory or Hugging Face dataset ID "
+            "(for example Jkatzy/code-comments)."
+        ),
+    )
     topic_modelling.add_argument("--output-directory", type=Path)
     topic_modelling.add_argument(
         "--score-threshold",
@@ -311,6 +334,24 @@ def build_parser() -> argparse.ArgumentParser:
     topic_modelling.add_argument("--languages", help="Comma-separated language directory names to include.")
     topic_modelling.add_argument("--max-shards", type=int)
     topic_modelling.add_argument("--batch-size", type=int, default=8192)
+    topic_modelling.add_argument(
+        "--sharing-prefilter",
+        action="store_true",
+        help=(
+            "Before clustering, keep only comments containing a curated "
+            "sharing/confidentiality keyword."
+        ),
+    )
+    topic_modelling.add_argument(
+        "--prefilter-keyword",
+        dest="prefilter_keywords",
+        action="append",
+        metavar="WORD_OR_PHRASE",
+        help=(
+            "Before clustering, keep comments matching this whole word or phrase; "
+            "repeat to match any term. Extends --sharing-prefilter when both are used."
+        ),
+    )
     topic_modelling.add_argument("--min-topic-size", type=int, default=10)
     topic_modelling.add_argument(
         "--calculate-probabilities",
@@ -564,6 +605,224 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_redistribution.add_argument("output_directory", type=Path)
 
+    classifier_dataset = subparsers.add_parser(
+        "build-classifier-dataset",
+        help=(
+            "Mine and LLM-validate sharing restrictions, ScanCode-missed licenses, "
+            "and irrelevant comments."
+        ),
+    )
+    classifier_dataset.add_argument(
+        "input_directory",
+        help="Local scored Parquet tree or Hugging Face dataset ID.",
+    )
+    classifier_dataset.add_argument(
+        "output_directory",
+        type=Path,
+        help="Directory for verified audit and training artifacts.",
+    )
+    classifier_dataset.add_argument(
+        "--combination",
+        action="append",
+        required=True,
+        metavar="DATASET:LANGUAGE",
+        help="Dataset/language slice to mine; repeat for a matrix.",
+    )
+    classifier_quota = classifier_dataset.add_mutually_exclusive_group()
+    classifier_quota.add_argument(
+        "--target-per-combination",
+        type=int,
+        help=(
+            "Accepted-row goal and cap for each class in each dataset/language "
+            "cell; defaults to 25 when neither target mode is specified."
+        ),
+    )
+    classifier_quota.add_argument(
+        "--target-per-class",
+        type=int,
+        help=(
+            "Global accepted-row goal and cap for each class, allocated max-min "
+            "fairly across dataset/language cells."
+        ),
+    )
+    classifier_dataset.add_argument(
+        "--candidate-multiplier",
+        type=int,
+        default=4,
+        help="Pre-judge candidate budget multiplier for the active quota mode.",
+    )
+    classifier_dataset.add_argument(
+        "--candidate-target",
+        action="append",
+        metavar="LABEL=N",
+        help=(
+            "Override a global class's pre-judge candidate budget; repeat by "
+            "label. Unspecified labels use --candidate-multiplier."
+        ),
+    )
+    classifier_dataset.add_argument(
+        "--candidate-pool-multiplier",
+        type=int,
+        default=8,
+        help="Raw per-cell reservoir headroom before candidate template diversity.",
+    )
+    classifier_dataset.add_argument(
+        "--max-candidates-per-pool",
+        type=int,
+        default=100000,
+        help="Maximum raw reservoir rows retained for one class/cell.",
+    )
+    classifier_shards = classifier_dataset.add_mutually_exclusive_group()
+    classifier_shards.add_argument(
+        "--max-shards-per-combination",
+        type=int,
+        default=10,
+        help="Scan at most the first N lexicographically sorted Parquet shards per cell.",
+    )
+    classifier_shards.add_argument(
+        "--all-shards",
+        action="store_true",
+        help="Scan every Parquet shard in each selected cell.",
+    )
+    classifier_dataset.add_argument(
+        "--batch-size",
+        type=int,
+        default=8192,
+        help="Rows per Parquet scan batch; this does not change selection semantics.",
+    )
+    classifier_dataset.add_argument(
+        "--min-comment-chars",
+        type=int,
+        default=12,
+        help="Ignore comments shorter than this many characters.",
+    )
+    classifier_dataset.add_argument(
+        "--max-comment-chars",
+        type=int,
+        default=12000,
+        help="Ignore comments longer than this many characters.",
+    )
+    classifier_dataset.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic retrieval tie-breaking and split assignment.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-passes",
+        type=int,
+        default=2,
+        help="Must be exactly 2 so each distinct review setup runs once.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-batch-size",
+        type=int,
+        default=10,
+        help="Candidates per judge request; batch membership is part of the cache key.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-workers",
+        type=int,
+        default=1,
+        help="Concurrent judge requests.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-confidence-threshold",
+        type=float,
+        default=0.8,
+        help="Minimum confidence required from both reviews.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-max-comment-chars",
+        type=int,
+        default=12000,
+        help="Judge payload limit; must be at least --max-comment-chars.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-retries",
+        type=int,
+        default=1,
+        help="Retries after the initial attempt for malformed or failed judge output.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-cache",
+        type=Path,
+        help="Persistent SQLite decision cache outside the replaceable output directory.",
+    )
+    classifier_dataset.add_argument(
+        "--judge-cache-epoch",
+        help=(
+            "Stable cache namespace for a multi-day run; defaults to the current "
+            "UTC date for legacy behavior."
+        ),
+    )
+    classifier_dataset.add_argument(
+        "--codex-command",
+        default="codex",
+        help="Codex executable or command prefix.",
+    )
+    classifier_dataset.add_argument(
+        "--codex-model",
+        help="Explicit Codex model name; pin this for auditable runs.",
+    )
+    classifier_dataset.add_argument(
+        "--codex-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for each judge request.",
+    )
+    classifier_dataset.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Write a reusable candidate plan without invoking any LLM judge.",
+    )
+    classifier_dataset.add_argument(
+        "--candidate-plan",
+        type=Path,
+        help="Reuse a validated scan-only candidate-plan directory.",
+    )
+    classifier_dataset.add_argument(
+        "--progress-every-shards",
+        type=int,
+        default=25,
+        help="Log scan progress after every N completed shards; 0 disables.",
+    )
+    classifier_dataset.add_argument(
+        "--progress-every-judge-batches",
+        type=int,
+        default=10,
+        help="Log judge progress after every N completed batches; 0 disables.",
+    )
+    classifier_dataset.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Atomically replace a recognizable prior classifier output after the "
+            "new staging build verifies."
+        ),
+    )
+
+    verify_classifier = subparsers.add_parser(
+        "verify-classifier-dataset",
+        help="Verify schema, class invariants, judge consensus, deduplication, and splits.",
+    )
+    verify_classifier.add_argument("output_directory", type=Path)
+    verify_classifier.add_argument(
+        "--allow-incomplete-combinations",
+        action="store_true",
+        help="Do not require every requested dataset/language slice to contain every class.",
+    )
+    verify_classifier.add_argument(
+        "--write-report",
+        action="store_true",
+        help="Replace verification.json with the current verification report.",
+    )
+    verify_classifier.add_argument(
+        "--verify-source",
+        action="store_true",
+        help="Also trust and re-read the manifest's original source shards.",
+    )
+
     encoding_benchmark = subparsers.add_parser(
         "benchmark-encoding-capacity",
         help="Measure how many comment samples can be encoded by 2M-8B parameter models.",
@@ -705,6 +964,73 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-errors",
         action="store_true",
         help="Continue with the next id package when one package fails.",
+    )
+
+    stack_v3_shards = subparsers.add_parser(
+        "mine-stack-v3-shards",
+        help="Mine Stack v3 full-corpus bucket shards in parallel.",
+    )
+    stack_v3_shards.add_argument("config", type=Path)
+    stack_v3_shards.add_argument("dataset")
+    stack_v3_shards.add_argument("--languages", help="Comma-separated partition names to include.")
+    stack_v3_shards.add_argument(
+        "--exclude-languages",
+        help="Comma-separated partition names to skip, even when included by the full inventory.",
+    )
+    stack_v3_shards.add_argument("--token-env")
+    stack_v3_shards.add_argument("--max-languages", type=int)
+    stack_v3_shards.add_argument("--max-shards", type=int)
+    stack_v3_shards.add_argument(
+        "--shuffle-shards",
+        action="store_true",
+        help="Shuffle all pending shards before launching workers to mix language workloads.",
+    )
+    stack_v3_shards.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed used by --shuffle-shards.",
+    )
+    stack_v3_shards.add_argument("--listing-workers", type=int, default=64)
+    stack_v3_shards.add_argument("--shard-workers", type=int, default=128)
+    stack_v3_shards.add_argument(
+        "--max-extraction-workers",
+        type=int,
+        default=80,
+        help="Maximum memory-heavy Parquet extractors; downloads may still use all shard workers.",
+    )
+    stack_v3_shards.add_argument("--max-comment-start-row", type=int, default=10)
+    stack_v3_shards.add_argument("--progress-every", type=int, default=10_000)
+    stack_v3_shards.add_argument(
+        "--min-free-gb",
+        type=int,
+        default=20,
+        help="Stop scheduling shards when free disk falls below this value; 0 disables the guard.",
+    )
+    stack_v3_shards.add_argument(
+        "--min-available-memory-gb",
+        type=int,
+        default=16,
+        help=(
+            "Checkpoint and requeue active shards, then pause scheduling, when host memory "
+            "falls below this value. New workers additionally reserve 125% of the largest "
+            "active worker's RSS above this floor; 0 disables."
+        ),
+    )
+    stack_v3_shards.add_argument(
+        "--rerun-completed-shards",
+        action="store_true",
+        help="Process shards even when their Stack v3 completion marker exists.",
+    )
+    stack_v3_shards.add_argument(
+        "--skip-errors",
+        action="store_true",
+        help="Continue with other shards if one download or extraction fails.",
+    )
+    stack_v3_shards.add_argument(
+        "--refresh-listing",
+        action="store_true",
+        help="Refresh the bucket inventory instead of using its local cache.",
     )
 
     export_hf = subparsers.add_parser(
@@ -930,6 +1256,8 @@ def _build_source(
     show_progress: bool,
     token_env: str | None,
     max_files: int | None = None,
+    file_partition_count: int = 1,
+    file_partition_index: int = 0,
     prefetch_files: int | None = None,
     download_workers: int | None = None,
     content_download_workers: int | None = None,
@@ -938,8 +1266,52 @@ def _build_source(
     cache_source_files: bool | None = None,
 ):
     dataset = config.require_dataset(dataset_name)
+    if file_partition_count < 1:
+        raise ValueError("file_partition_count must be at least 1")
+    if not 0 <= file_partition_index < file_partition_count:
+        raise ValueError(
+            "file_partition_index must be between 0 and "
+            f"{file_partition_count - 1}"
+        )
+    dataset.extra["file_partition_count"] = file_partition_count
+    dataset.extra["file_partition_index"] = file_partition_index
     token = _resolve_token(token_env)
     if dataset.source == "huggingface_hub":
+        if dataset.extra.get("source_format") == "redpajama_v1_github":
+            return dataset, RedPajamaV1GitHubSource(
+                config,
+                dataset,
+                language=language,
+                show_progress=show_progress,
+                token=token,
+                max_files=max_files,
+                prefetch_files=prefetch_files,
+                download_workers=download_workers,
+            )
+        if dataset.extra.get("source_format") == "pile_github_zstd_jsonl":
+            return dataset, PileGitHubZstdJsonlSource(
+                config,
+                dataset,
+                language=language,
+                show_progress=show_progress,
+                token=token,
+                max_files=max_files,
+                prefetch_files=prefetch_files,
+                download_workers=download_workers,
+                cache_source_files=cache_source_files,
+            )
+        if dataset.extra.get("source_format") == "gzip_jsonl":
+            return dataset, HuggingFaceGzipJsonlSource(
+                config,
+                dataset,
+                language=language,
+                show_progress=show_progress,
+                token=token,
+                max_files=max_files,
+                prefetch_files=prefetch_files,
+                download_workers=download_workers,
+                cache_source_files=cache_source_files,
+            )
         source_class = (
             StackV2SWHContentSource
             if dataset.extra.get("content_backend") == "softwareheritage_s3"
@@ -973,6 +1345,8 @@ def _mine_dataset(
     token_env: str | None,
     max_records: int | None,
     max_files: int | None,
+    file_partition_count: int,
+    file_partition_index: int,
     max_comment_start_row: int,
     prefetch_files: int | None,
     download_workers: int | None,
@@ -992,6 +1366,8 @@ def _mine_dataset(
         show_progress=show_progress,
         token_env=token_env,
         max_files=max_files,
+        file_partition_count=file_partition_count,
+        file_partition_index=file_partition_index,
         prefetch_files=prefetch_files,
         download_workers=download_workers,
         content_download_workers=content_download_workers,
@@ -1144,7 +1520,7 @@ def _license_score_histogram(
 
 
 def _topic_model_low_scancode(
-    input_directory: Path,
+    input_directory: Path | str,
     *,
     output_directory: Path | None,
     score_threshold: float,
@@ -1152,6 +1528,8 @@ def _topic_model_low_scancode(
     languages: list[str] | None,
     max_shards: int | None,
     batch_size: int,
+    sharing_prefilter: bool = False,
+    prefilter_keywords: list[str] | None = None,
     min_topic_size: int,
     calculate_probabilities: bool,
     topic_sample_size: int,
@@ -1164,10 +1542,15 @@ def _topic_model_low_scancode(
     judge_max_topics: int | None,
     overwrite: bool,
 ) -> int:
+    effective_prefilter_keywords = [
+        *(SHARING_PREFILTER_KEYWORDS if sharing_prefilter else ()),
+        *(prefilter_keywords or ()),
+    ]
     stats = run_low_scancode_topic_modelling(
         input_directory,
         output_directory=output_directory,
         score_threshold=score_threshold,
+        prefilter_keywords=effective_prefilter_keywords or None,
         dataset_names=dataset_names,
         languages=languages,
         max_shards=max_shards,
@@ -1189,6 +1572,11 @@ def _topic_model_low_scancode(
     print(f"Input format: {stats.input_format}")
     print(f"Score threshold: {stats.score_threshold} ({stats.normalized_score_threshold} on 0-100 scale)")
     print(f"Records seen: {stats.records_seen}")
+    print(
+        "Records before keyword prefilter: "
+        f"{stats.records_before_keyword_prefilter}"
+    )
+    print(f"Records filtered out by keywords: {stats.records_prefiltered_out}")
     print(f"Records selected: {stats.records_selected}")
     print(f"Records modelled: {stats.records_modelled}")
     print(f"Topics discovered: {stats.topics_discovered}")
@@ -1275,6 +1663,55 @@ def _split_int_csv(value: str | None) -> list[int] | None:
     if value is None:
         return None
     return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _parse_combinations(values: Sequence[str]) -> list[tuple[str, str]]:
+    combinations: list[tuple[str, str]] = []
+    for value in values:
+        if ":" not in value:
+            raise ValueError(
+                f"Combination must use DATASET:LANGUAGE syntax, got {value!r}"
+            )
+        dataset, language = value.split(":", 1)
+        dataset = dataset.strip()
+        language = language.strip()
+        if not dataset or not language:
+            raise ValueError(
+                f"Combination must have a non-empty dataset and language, got {value!r}"
+            )
+        combinations.append((dataset, language))
+    return combinations
+
+
+def _parse_candidate_targets(
+    values: Sequence[str] | None,
+) -> dict[str, int] | None:
+    if not values:
+        return None
+    targets: dict[str, int] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                f"Candidate target must use LABEL=N syntax, got {value!r}"
+            )
+        label, raw_target = (part.strip() for part in value.split("=", 1))
+        if label not in CLASS_LABELS:
+            raise ValueError(
+                f"Unknown candidate label {label!r}; expected one of "
+                f"{', '.join(CLASS_LABELS)}"
+            )
+        if label in targets:
+            raise ValueError(f"Candidate target repeats label {label!r}")
+        try:
+            target = int(raw_target)
+        except ValueError as exc:
+            raise ValueError(
+                f"Candidate target for {label!r} must be an integer"
+            ) from exc
+        if target < 1:
+            raise ValueError(f"Candidate target for {label!r} must be >= 1")
+        targets[label] = target
+    return targets
 
 
 def _build_redistribution_candidate_dataset_command(
@@ -1391,6 +1828,120 @@ def _verify_redistribution_candidate_dataset_command(
     for error in report.errors:
         print(f"- {error}")
     return 0 if report.valid else 1
+
+
+def _build_classifier_dataset_command(
+    input_directory: str,
+    output_directory: Path,
+    *,
+    combinations: list[tuple[str, str]],
+    target_per_combination: int | None,
+    target_per_class: int | None,
+    candidate_multiplier: int,
+    candidate_targets: dict[str, int] | None,
+    candidate_pool_multiplier: int,
+    max_candidates_per_pool: int,
+    max_shards_per_combination: int | None,
+    batch_size: int,
+    min_comment_chars: int,
+    max_comment_chars: int,
+    seed: int,
+    judge_passes: int,
+    judge_batch_size: int,
+    judge_workers: int,
+    judge_confidence_threshold: float,
+    judge_max_comment_chars: int,
+    judge_retries: int,
+    judge_cache: Path | None,
+    judge_cache_epoch: str | None,
+    codex_command: str,
+    codex_model: str | None,
+    codex_timeout: int,
+    scan_only: bool,
+    candidate_plan: Path | None,
+    progress_every_shards: int,
+    progress_every_judge_batches: int,
+    overwrite: bool,
+) -> int:
+    stats = build_classifier_dataset(
+        input_directory,
+        output_directory,
+        combinations=combinations,
+        target_per_combination=target_per_combination,
+        target_per_class=target_per_class,
+        candidate_multiplier=candidate_multiplier,
+        candidate_targets=candidate_targets,
+        candidate_pool_multiplier=candidate_pool_multiplier,
+        max_candidates_per_pool=max_candidates_per_pool,
+        max_shards_per_combination=max_shards_per_combination,
+        batch_size=batch_size,
+        min_comment_chars=min_comment_chars,
+        max_comment_chars=max_comment_chars,
+        seed=seed,
+        judge_passes=judge_passes,
+        judge_batch_size=judge_batch_size,
+        judge_workers=judge_workers,
+        judge_confidence_threshold=judge_confidence_threshold,
+        judge_max_comment_chars=judge_max_comment_chars,
+        judge_retries=judge_retries,
+        judge_cache_path=judge_cache,
+        judge_cache_epoch=judge_cache_epoch,
+        codex_command=codex_command,
+        codex_model=codex_model,
+        codex_timeout=codex_timeout,
+        scan_only=scan_only,
+        candidate_plan=candidate_plan,
+        progress_every_shards=progress_every_shards,
+        progress_every_judge_batches=progress_every_judge_batches,
+        overwrite=overwrite,
+    )
+    print(f"Input directory: {stats.input_directory}")
+    print(f"Output directory: {stats.output_directory}")
+    print(f"Combinations found: {stats.combinations_found}/{stats.combinations_requested}")
+    print(f"Shards scanned: {stats.shards_scanned}")
+    print(f"Records scanned: {stats.records_scanned}")
+    print(
+        f"Candidates {'planned' if scan_only else 'judged'}: "
+        f"{stats.candidates_selected}"
+    )
+    if scan_only:
+        print(f"Candidate table: {stats.candidates_path}")
+        print(f"Candidate plan: {stats.manifest_path}")
+        return 0
+    print(f"Accepted records: {stats.accepted}")
+    print(f"Rejected records: {stats.rejected}")
+    print(f"Judge calls: {stats.judge_calls}; cache hits: {stats.judge_cache_hits}")
+    print(f"Binary training data: {stats.binary_training_path}")
+    print(f"Multiclass training data: {stats.multiclass_training_path}")
+    print(f"Audit dataset: {stats.dataset_path}")
+    print(f"Manifest: {stats.manifest_path}")
+    print(f"Verification: {stats.verification_path}")
+    return 0
+
+
+def _verify_classifier_dataset_command(
+    output_directory: Path,
+    *,
+    require_all_classes_per_combination: bool,
+    write_report: bool,
+    verify_source: bool,
+) -> int:
+    report = verify_classifier_dataset(
+        output_directory,
+        require_all_classes_per_combination=require_all_classes_per_combination,
+        verify_source=verify_source,
+    )
+    print(f"Valid: {report['valid']}")
+    print(f"Rows: {report['rows']}")
+    print(f"Unique comments: {report['unique_comment_hashes']}")
+    print("Class counts:")
+    for label, count in report["class_counts"].items():
+        print(f"- {label}: {count}")
+    if write_report:
+        report_path = output_directory.resolve() / "verification.json"
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"Report: {report_path}")
+    return 0
 
 
 def _mine_config(
@@ -1568,6 +2119,67 @@ def _mine_stack_v2_packages_command(
             print(f"- {package}")
     return 0
 
+
+def _mine_stack_v3_shards_command(
+    config_path: Path,
+    dataset_name: str,
+    *,
+    languages: list[str] | None,
+    exclude_languages: list[str] | None,
+    token_env: str | None,
+    max_languages: int | None,
+    max_shards: int | None,
+    listing_workers: int,
+    shard_workers: int,
+    max_extraction_workers: int,
+    max_comment_start_row: int,
+    progress_every: int,
+    skip_completed_shards: bool,
+    skip_errors: bool,
+    refresh_listing: bool,
+    shuffle_shards: bool,
+    shuffle_seed: int,
+    min_free_gb: int,
+    min_available_memory_gb: int,
+) -> int:
+    config = PipelineConfig.from_path(config_path)
+    dataset = config.require_dataset(dataset_name)
+    summary = mine_stack_v3_bucket_shards(
+        config,
+        dataset,
+        token=_resolve_token(token_env),
+        languages=languages,
+        exclude_languages=exclude_languages,
+        max_languages=max_languages,
+        max_shards=max_shards,
+        listing_workers=listing_workers,
+        shard_workers=shard_workers,
+        max_extraction_workers=max_extraction_workers,
+        max_comment_start_row=max_comment_start_row,
+        progress_every=progress_every,
+        skip_completed_shards=skip_completed_shards,
+        skip_errors=skip_errors,
+        refresh_listing=refresh_listing,
+        shuffle_shards=shuffle_shards,
+        shuffle_seed=shuffle_seed,
+        min_free_gb=min_free_gb,
+        min_available_memory_gb=min_available_memory_gb,
+    )
+    print(f"Dataset: {summary.dataset}")
+    print(f"Bucket: {summary.bucket_id}")
+    print(f"Languages planned: {summary.languages_planned}")
+    print(f"Shards planned: {summary.shards_planned}")
+    print(f"Shards skipped: {summary.shards_skipped}")
+    print(f"Shards completed: {summary.shards_completed}")
+    print(f"Compressed bytes planned: {summary.bytes_planned}")
+    print(f"Records seen: {summary.records_seen}")
+    print(f"Comments written: {summary.comments_written}")
+    if summary.failed_shards:
+        print("Failed shards:")
+        for shard in summary.failed_shards:
+            print(f"- {shard}")
+    return 0
+
 def _export_hf_dataset(
     config_path: Path,
     output_directory: Path,
@@ -1658,6 +2270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token_env=args.token_env,
                 max_records=args.max_records,
                 max_files=args.max_files,
+                file_partition_count=args.file_partition_count,
+                file_partition_index=args.file_partition_index,
                 max_comment_start_row=args.max_comment_start_row,
                 prefetch_files=args.prefetch_files,
                 download_workers=args.download_workers,
@@ -1721,6 +2335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 languages=_split_csv(args.languages),
                 max_shards=args.max_shards,
                 batch_size=args.batch_size,
+                sharing_prefilter=args.sharing_prefilter,
+                prefilter_keywords=args.prefilter_keywords,
                 min_topic_size=args.min_topic_size,
                 calculate_probabilities=args.calculate_probabilities,
                 topic_sample_size=args.topic_sample_size,
@@ -1775,6 +2391,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "verify-redistribution-candidate-dataset":
             return _verify_redistribution_candidate_dataset_command(
                 args.output_directory,
+            )
+        if args.command == "build-classifier-dataset":
+            return _build_classifier_dataset_command(
+                args.input_directory,
+                args.output_directory,
+                combinations=_parse_combinations(args.combination),
+                target_per_combination=args.target_per_combination,
+                target_per_class=args.target_per_class,
+                candidate_multiplier=args.candidate_multiplier,
+                candidate_targets=_parse_candidate_targets(
+                    args.candidate_target
+                ),
+                candidate_pool_multiplier=args.candidate_pool_multiplier,
+                max_candidates_per_pool=args.max_candidates_per_pool,
+                max_shards_per_combination=(
+                    None
+                    if args.all_shards
+                    else args.max_shards_per_combination
+                ),
+                batch_size=args.batch_size,
+                min_comment_chars=args.min_comment_chars,
+                max_comment_chars=args.max_comment_chars,
+                seed=args.seed,
+                judge_passes=args.judge_passes,
+                judge_batch_size=args.judge_batch_size,
+                judge_workers=args.judge_workers,
+                judge_confidence_threshold=args.judge_confidence_threshold,
+                judge_max_comment_chars=args.judge_max_comment_chars,
+                judge_retries=args.judge_retries,
+                judge_cache=args.judge_cache,
+                judge_cache_epoch=args.judge_cache_epoch,
+                codex_command=args.codex_command,
+                codex_model=args.codex_model,
+                codex_timeout=args.codex_timeout,
+                scan_only=args.scan_only,
+                candidate_plan=args.candidate_plan,
+                progress_every_shards=args.progress_every_shards,
+                progress_every_judge_batches=(
+                    args.progress_every_judge_batches
+                ),
+                overwrite=args.overwrite,
+            )
+        if args.command == "verify-classifier-dataset":
+            return _verify_classifier_dataset_command(
+                args.output_directory,
+                require_all_classes_per_combination=(
+                    not args.allow_incomplete_combinations
+                ),
+                write_report=args.write_report,
+                verify_source=args.verify_source,
             )
         if args.command == "benchmark-encoding-capacity":
             return _benchmark_encoding_capacity(
@@ -1843,6 +2509,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skip_completed_packages=not args.rerun_completed_packages,
                 skip_errors=args.skip_errors,
             )
+        if args.command == "mine-stack-v3-shards":
+            return _mine_stack_v3_shards_command(
+                args.config,
+                args.dataset,
+                languages=_split_csv(args.languages),
+                exclude_languages=_split_csv(args.exclude_languages),
+                token_env=args.token_env,
+                max_languages=args.max_languages,
+                max_shards=args.max_shards,
+                listing_workers=args.listing_workers,
+                shard_workers=args.shard_workers,
+                max_extraction_workers=args.max_extraction_workers,
+                max_comment_start_row=args.max_comment_start_row,
+                progress_every=args.progress_every,
+                skip_completed_shards=not args.rerun_completed_shards,
+                skip_errors=args.skip_errors,
+                refresh_listing=args.refresh_listing,
+                shuffle_shards=args.shuffle_shards,
+                shuffle_seed=args.shuffle_seed,
+                min_free_gb=args.min_free_gb,
+                min_available_memory_gb=args.min_available_memory_gb,
+            )
         if args.command == "export-hf-dataset":
             return _export_hf_dataset(
                 args.config,
@@ -1859,6 +2547,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     except (KeyError, ValueError) as exc:
         parser.exit(status=2, message=f"{exc}\n")
+    except StackV3MemorySafeguardError as exc:
+        parser.exit(status=75, message=f"{exc}\n")
     except RuntimeError as exc:
         parser.exit(status=1, message=f"{exc}\n")
 

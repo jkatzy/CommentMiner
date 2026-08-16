@@ -264,6 +264,31 @@ class HuggingFaceDownloader:
             token=token,
             cache_directory=self.remote_file_cache_directory(config),
         )
+        file_start_at = dataset.extra.get("file_start_at")
+        if file_start_at is not None:
+            remote_files = [
+                remote for remote in remote_files if remote.path >= str(file_start_at)
+            ]
+        file_stop_at = dataset.extra.get("file_stop_at")
+        if file_stop_at is not None:
+            remote_files = [
+                remote for remote in remote_files if remote.path <= str(file_stop_at)
+            ]
+        partition_count = int(dataset.extra.get("file_partition_count", 1))
+        partition_index = int(dataset.extra.get("file_partition_index", 0))
+        if partition_count < 1:
+            raise ValueError("file_partition_count must be at least 1")
+        if not 0 <= partition_index < partition_count:
+            raise ValueError(
+                "file_partition_index must be between 0 and "
+                f"{partition_count - 1}"
+            )
+        if partition_count > 1:
+            remote_files = [
+                remote
+                for index, remote in enumerate(remote_files)
+                if index % partition_count == partition_index
+            ]
         completed = set(checkpoint.completed_files)
         remote_paths = {remote.path for remote in remote_files}
         pending_files = [remote for remote in remote_files if remote.path not in completed]

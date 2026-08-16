@@ -7,6 +7,54 @@ from commentminer.models import InputRecord
 
 
 class ExtractorTests(unittest.TestCase):
+    def test_ml4se_extractor_can_detect_language_from_content(self) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+        record = InputRecord(
+            dataset="pile-uncopyrighted-github",
+            record_id="r-content-detection",
+            content=(
+                "# Copyright 2026 Example\n"
+                "def greet(name: str) -> str:\n"
+                "    return f'Hello, {name}'\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    print(greet('world'))\n"
+            ),
+            metadata={"detect_language_from_content": True},
+        )
+
+        comments = extractor.extract_opening_comments(record)
+
+        self.assertIn("python", extractor._resolve_languages(record))
+        self.assertEqual(
+            [comment.text for comment in comments],
+            ["# Copyright 2026 Example"],
+        )
+
+    def test_ml4se_extractor_checks_all_languages_for_ambiguous_extension(
+        self,
+    ) -> None:
+        extractor = ML4SEOpeningCommentExtractor()
+        record = InputRecord(
+            dataset="redpajama-v1-github",
+            record_id="r-header",
+            content="// shared header\nint value;\n",
+            path="include/value.h",
+            metadata={"ext": "h"},
+        )
+
+        comments = extractor.extract_opening_comments(record)
+
+        self.assertEqual(
+            extractor._resolve_languages(record),
+            ["c", "c++", "objective-c"],
+        )
+        self.assertEqual([comment.text for comment in comments], ["// shared header"])
+        self.assertEqual(
+            set(extractor._queries),
+            {"c", "c++", "objective-c"},
+        )
+
     def test_ml4se_extractor_uses_record_metadata_language(self) -> None:
         extractor = ML4SEOpeningCommentExtractor()
         record = InputRecord(
